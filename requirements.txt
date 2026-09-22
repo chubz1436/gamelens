@@ -1,0 +1,15 @@
+# --- capture ---
+windows-capture==1.4.2   # Windows Graphics Capture (Rust-backed, GPU path)
+mss==9.0.1               # DXGI-ish fallback / multi-monitor full-screen
+pywin32==306             # window enumeration, client<->screen mapping
+
+# --- imaging ---
+numpy==1.26.4
+opencv-python==4.10.0.84 # resize, template match, JPEG encode
+
+# --- serving ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# --- agent ---
+anthropic==0.39.0

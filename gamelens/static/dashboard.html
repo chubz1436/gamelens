@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GameLens</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --line:#272e38; --fg:#e6edf3; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; letter-spacing:.3px; }
+  h1 span { color:var(--accent); }
+  .pill { font:12px/1 var(--mono); padding:5px 9px; border-radius:999px;
+          border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .pill.on  { color:var(--ok);   border-color:var(--ok); }
+  .pill.off { color:var(--dim); }
+  .pill.hot { color:var(--bad);  border-color:var(--bad);
+              animation:pulse 1s ease-in-out infinite; }
+  .pill.dry { color:var(--warn); border-color:var(--warn); }
+  @keyframes pulse { 50% { opacity:.45; } }
+  main { display:grid; grid-template-columns:1fr 340px; gap:12px; padding:12px; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .stage { position:relative; background:#000; border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; line-height:0; }
+  .stage img { width:100%; height:auto; display:block; }
+  #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  aside { display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:8px; padding:12px; }
+  .card h2 { font-size:11px; text-transform:uppercase; letter-spacing:.9px;
+             color:var(--dim); margin:0 0 9px; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:4px 12px;
+       margin:0; font:12px/1.6 var(--mono); }
+  dt { color:var(--dim); }
+  dd { margin:0; text-align:right; overflow:hidden; text-overflow:ellipsis; }
+  #log { font:11px/1.55 var(--mono); max-height:260px; overflow-y:auto;
+         margin:0; white-space:pre-wrap; word-break:break-word; }
+  #log div { padding:2px 0; border-bottom:1px solid #1d232c; }
+  #log .t { color:var(--dim); }
+  #log .denied, #log .error, #log .cancelled { color:var(--bad); }
+  #log .dry    { color:var(--warn); }
+  #log .sent   { color:var(--ok); }
+  /* Still in the executor's queue. Deliberately not green: nothing has
+     happened yet, and an entry that reads as success before the press is
+     decided is the whole defect this colour exists to avoid. */
+  #log .queued { color:var(--dim); }
+  button { font:12px var(--mono); padding:7px 12px; border-radius:6px;
+           border:1px solid var(--line); background:#1f2630; color:var(--fg);
+           cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  kbd { font:11px var(--mono); background:#1f2630; border:1px solid var(--line);
+        border-bottom-width:2px; border-radius:4px; padding:1px 5px; }
+  .note { color:var(--dim); font-size:11px; margin:9px 0 0; }
+  #gate { position:fixed; inset:0; background:rgba(9,12,16,.92); display:none;
+          align-items:center; justify-content:center; z-index:50; padding:16px; }
+  #gate .box { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+               padding:20px; max-width:440px; width:100%; }
+  #gate h3 { margin:0 0 6px; font-size:14px; }
+  #gate p { color:var(--dim); font-size:12px; margin:0 0 14px; }
+  #gate-msg { color:var(--warn); font-size:12px; min-height:16px; margin:0 0 8px; }
+  #gate-input { width:100%; font:13px var(--mono); padding:9px 10px; border-radius:6px;
+                border:1px solid var(--line); background:#0e1116; color:var(--fg); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Game<span>Lens</span></h1>
+  <span class="pill" id="p-target">no target</span>
+  <span class="pill" id="p-fps">-- fps</span>
+  <span class="pill" id="p-age">-- ms</span>
+  <span class="pill" id="p-backend">--</span>
+  <span class="pill" id="p-arm">disarmed</span>
+  <span class="pill" id="p-mode">dry-run</span>
+  <span style="flex:1"></span>
+  <span class="pill">kill: <kbd>F12</kbd></span>
+</header>
+
+
+<div id="gate">
+  <div class="box">
+    <h3>Session token required</h3>
+    <p>GameLens printed a one-time token to its console at startup. Loopback access is
+       not treated as operator identity, so this page is served without it.</p>
+    <p id="gate-msg"></p>
+    <input id="gate-input" type="password" autocomplete="off" spellcheck="false"
+           placeholder="paste token">
+    <div class="row" style="margin-top:12px"><button id="gate-save">Unlock</button></div>
+  </div>
+</div>
+
+<main>
+  <div class="stage">
+    <img id="feed" alt="live feed">
+    <svg id="overlay" preserveAspectRatio="none"></svg>
+  </div>
+
+  <aside>
+    <div class="card">
+      <h2>Control</h2>
+      <div class="row">
+        <button id="btn-arm">Arm</button>
+        <button id="btn-live">Go live</button>
+        <button id="btn-stop" class="danger">Stop</button>
+      </div>
+      <p class="note">Arming alone does not inject. <em>Go live</em> leaves dry-run.
+        The kill key latches until restart.</p>
+    </div>
+
+    <div class="card">
+      <h2>Capture</h2>
+      <dl>
+        <dt>window</dt><dd id="s-title">--</dd>
+        <dt>size</dt><dd id="s-size">--</dd>
+        <dt>frame</dt><dd id="s-frame">--</dd>
+        <dt>p95 age</dt><dd id="s-p95">--</dd>
+        <dt>dropped</dt><dd id="s-drop">--</dd>
+        <dt>foreground</dt><dd id="s-fg">--</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <h2>Agent</h2>
+      <dl>
+        <dt>tier</dt><dd id="s-tier">--</dd>
+        <dt>reflex p95</dt><dd id="s-reflex">--</dd>
+        <dt>vision</dt><dd id="s-vision">--</dd>
+      </dl>
+      <p class="note" id="s-intent">idle</p>
+    </div>
+
+    <div class="card">
+      <h2>Action log</h2>
+      <div id="log"></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const feed = $('feed');
+const overlay = $('overlay');
+const seen = new Map();   // entry id -> its row, so a resolved entry can be updated
+
+// --- credential bootstrap -------------------------------------------------
+// This page is served WITHOUT the session token. If the token were baked in,
+// any local process could GET / and read it back out, which would make the
+// token worthless as an operator credential -- loopback reachability is not
+// operator identity. The token is printed once to the GameLens console; the
+// operator pastes it here, and it is held in sessionStorage for this tab only.
+let TOKEN = '';
+try { TOKEN = sessionStorage.getItem('gamelens_token') || ''; } catch (e) { TOKEN = ''; }
+
+function authHeaders() {
+  return TOKEN ? { 'X-GameLens-Token': TOKEN } : {};
+}
+
+function showGate(message) {
+  $('gate-msg').textContent = message || '';
+  $('gate').style.display = 'flex';
+  $('gate-input').focus();
+}
+
+function hideGate() { $('gate').style.display = 'none'; }
+
+$('gate-save').onclick = () => {
+  const v = $('gate-input').value.trim();
+  if (!v) return;
+  TOKEN = v;
+  try { sessionStorage.setItem('gamelens_token', v); } catch (e) { /* private mode */ }
+  $('gate-input').value = '';
+  hideGate();
+  startFeed();
+  tick();
+};
+$('gate-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('gate-save').click();
+});
+
+// The MJPEG stream is an <img>, which cannot carry a custom header, so the
+// token rides as a query parameter on this one endpoint. It never leaves the
+// loopback origin and the server treats it as equivalent to the header.
+function startFeed() {
+  if (!TOKEN) return;
+  feed.src = '/stream.mjpg?token=' + encodeURIComponent(TOKEN) + '&t=' + Date.now();
+}
+feed.onerror = () => setTimeout(startFeed, 1500);
+startFeed();
+
+function pill(el, text, cls) {
+  el.textContent = text;
+  el.className = 'pill ' + (cls || '');
+}
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+function svg(tag, attrs) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+// Marks carry model-authored text. Never build SVG by string concatenation here:
+// a label like `</text><image href=x onerror=...>` would become executable
+// same-origin markup, and this page can reach the operator endpoints. Elements
+// are created via the DOM and label text is set with textContent, so a label is
+// always inert data no matter what produced it.
+function num(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Draw the agent's intended click points over the feed. In dry-run this overlay
+// is the only thing that happens, so it has to be accurate enough to trust
+// before anyone presses "Go live".
+function drawMarks(marks, w, h) {
+  overlay.setAttribute('viewBox', '0 0 ' + num(w, 1920) + ' ' + num(h, 1080));
+  while (overlay.firstChild) overlay.removeChild(overlay.firstChild);
+
+  (marks || []).forEach(function (m) {
+    const x = num(m.x, null), y = num(m.y, null);
+    if (x === null || y === null) return;           // unusable mark, skip it
+    const age = Math.max(0, num(m.age_ms, 0));
+
+    // Green means the press actually happened. A mark that stays green after
+    // the executor refused it is drawn on the exact spot the click did not
+    // land, which is worse than drawing nothing.
+    const c = (m.status === 'denied' || m.status === 'error' ||
+               m.status === 'cancelled')   ? '#f85149'
+            : m.status === 'dry'           ? '#d29922'
+            : m.status === 'queued'        ? '#768390'
+            : '#3fb950';
+    const r = 14 + (1 - Math.min(age / 2000, 1)) * 22;
+
+    const g = svg('g', { opacity: Math.max(0.15, 1 - age / 2000).toFixed(2) });
+    g.appendChild(svg('circle', {
+      cx: x, cy: y, r: r.toFixed(1), fill: 'none', stroke: c, 'stroke-width': 2.5 }));
+    g.appendChild(svg('line', {
+      x1: x - 9, y1: y, x2: x + 9, y2: y, stroke: c, 'stroke-width': 1.5 }));
+    g.appendChild(svg('line', {
+      x1: x, y1: y - 9, x2: x, y2: y + 9, stroke: c, 'stroke-width': 1.5 }));
+
+    if (m.label != null && m.label !== '') {
+      const t = svg('text', {
+        x: x + r + 6, y: y + 4, fill: c,
+        'font-family': 'monospace', 'font-size': 13 });
+      t.textContent = String(m.label);   // inert: never parsed as markup
+      g.appendChild(t);
+    }
+    overlay.appendChild(g);
+  });
+}
+
+function addLog(e) {
+  // Entries change after they are first drawn. An action is written down when
+  // it is queued and resolved when the executor reports what became of it, so
+  // a row that is only ever rendered once would freeze at "queued" -- or,
+  // worse, keep showing a success that was refused at press time.
+  let d = seen.get(e.id);
+  if (d) {
+    if (d.dataset.status !== e.status || d.dataset.text !== e.text) {
+      d.className = e.status;
+      d.dataset.status = e.status;
+      d.dataset.text = e.text;
+      d.lastChild.textContent = e.text;
+    }
+    return;
+  }
+  d = document.createElement('div');
+  d.className = e.status;
+  d.dataset.status = e.status;
+  d.dataset.text = e.text;
+  const t = document.createElement('span');
+  t.className = 't';
+  t.textContent = e.time + ' ';
+  d.appendChild(t);
+  d.appendChild(document.createTextNode(e.text));
+  seen.set(e.id, d);
+  $('log').prepend(d);
+  while ($('log').childElementCount > 120) {
+    const gone = $('log').lastElementChild;
+    seen.forEach(function (node, id) { if (node === gone) seen.delete(id); });
+    gone.remove();
+  }
+}
+
+async function tick() {
+  if (!TOKEN) { showGate('Paste the session token printed by GameLens at startup.'); return; }
+  try {
+    const res = await fetch('/state', { headers: authHeaders() });
+    if (res.status === 401 || res.status === 403) {
+      TOKEN = '';
+      try { sessionStorage.removeItem('gamelens_token'); } catch (e) { /* ignore */ }
+      showGate('That token was rejected. Paste the one printed at startup.');
+      return;
+    }
+    const s = await res.json();
+
+    pill($('p-target'), s.target ? s.target.title.slice(0, 32) : 'no target',
+         s.target ? 'on' : 'off');
+    pill($('p-fps'), s.capture.fps.toFixed(1) + ' fps');
+    pill($('p-age'), s.capture.age_ms.toFixed(0) + ' ms',
+         s.capture.age_ms > 250 ? 'hot' : 'on');
+    pill($('p-backend'), s.capture.backend);
+    pill($('p-arm'),
+         s.safety.killed ? 'KILLED' : s.safety.armed ? 'armed' : 'disarmed',
+         s.safety.killed ? 'hot' : s.safety.armed ? 'on' : 'off');
+    pill($('p-mode'), s.safety.dry_run ? 'dry-run' : 'LIVE',
+         s.safety.dry_run ? 'dry' : 'hot');
+
+    $('s-title').textContent  = s.target ? s.target.title.slice(0, 28) : '--';
+    $('s-size').textContent   = s.target ? s.target.width + 'x' + s.target.height : '--';
+    $('s-frame').textContent  = s.capture.frame_id;
+    $('s-p95').textContent    = s.capture.p95_age_ms.toFixed(0) + ' ms';
+    $('s-drop').textContent   = s.capture.dropped;
+    $('s-fg').textContent     = s.target && s.target.foreground ? 'yes' : 'no';
+    $('s-tier').textContent   = s.agent.tier;
+    $('s-reflex').textContent = s.agent.reflex_p95_ms.toFixed(0) + ' ms';
+    $('s-vision').textContent = s.agent.vision_fps.toFixed(1) + ' fps';
+    $('s-intent').textContent = s.agent.intent || 'idle';
+
+    drawMarks(s.marks, s.capture.width || 1920, s.capture.height || 1080);
+    (s.log || []).slice().reverse().forEach(addLog);
+  } catch (err) {
+    pill($('p-target'), 'server down', 'hot');
+  }
+}
+
+const post = (path) => fetch(path, { method: 'POST', headers: authHeaders() }).then(tick);
+$('btn-arm').onclick  = () => post('/arm');
+$('btn-live').onclick = () => post('/live');
+$('btn-stop').onclick = () => post('/stop');
+
+setInterval(tick, 400);
+tick();
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Scratch drivers written while driving a live game. Kept out of the tree on
+# purpose: they hardcode an HWND and a token path and are rewritten every run.
+_live.py
+_play.py
