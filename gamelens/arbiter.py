@@ -29,6 +29,16 @@ OBSERVATION_DEADLINE = 1.0
 # How long an action may sit between being created and being executed.
 ACTION_TTL = 0.8
 
+# Ceilings on the two things a caller can ask for that have no coordinate and
+# therefore no bounds check to fall back on. Both are clamps, not validations:
+# the action still happens, just not to an absurd degree.
+MAX_KEY_HOLD = 2.0          # seconds a key may be held by one action
+MAX_LOOK_DELTA = 600        # mickeys per look action, per axis
+# Longer than a key hold on purpose: breaking a block is a sustained press of
+# several seconds, and capping it at a key's ceiling would make mining
+# impossible rather than merely awkward.
+MAX_BUTTON_HOLD = 5.0       # seconds a mouse button may be held by one action
+
 
 class Rejection(Enum):
     OK = "ok"
@@ -343,6 +353,110 @@ class Arbiter:
             steps=[MoveTo(screen_x, screen_y), Dwell(settle),
                    ButtonDown(button), Dwell(hold), ButtonUp(button)],
             label=f"{label}@{int(frame_x)},{int(frame_y)}",
+            source=source,
+        )
+
+    # --- keyboard and camera --------------------------------------------
+
+    def key_action(
+        self,
+        observation: Observation,
+        key: str,
+        *,
+        hold: float = 0.08,
+        label: str = "key",
+        source: str = "agent",
+    ) -> Action:
+        """Press and release one key.
+
+        Bound to an observation like everything else. A keystroke has no
+        coordinate, so none of the geometry rules apply to it -- but the
+        freshness ones very much do. "Walk forward" is a decision about a scene,
+        and a scene two seconds stale is one the player has already left.
+
+        ``hold`` is clamped rather than trusted. This is the one action that can
+        hold input down, and an unclamped value is how a harness ends up with W
+        pressed for a minute because something upstream sent a float it did not
+        mean. The executor releases held keys on a kill, but not being able to
+        get into that state in the first place is better.
+        """
+        from gamelens.input import Dwell, KeyDown, KeyUp, key_code
+
+        vk = key_code(key)
+        hold = max(0.01, min(float(hold), MAX_KEY_HOLD))
+        return Action(
+            observation=observation,
+            steps=[KeyDown(vk), Dwell(hold), KeyUp(vk)],
+            label=f"{label}:{str(key).lower()}",
+            source=source,
+        )
+
+    def press_action(
+        self,
+        observation: Observation,
+        *,
+        button: str = "left",
+        hold: float = 0.08,
+        label: str = "press",
+        source: str = "agent",
+    ) -> Action:
+        """Hold a mouse button where the cursor already is. No movement at all.
+
+        This is the action a pointer-locked game needs and ``click_action``
+        cannot provide. Once a game grabs the cursor it hides it, re-centres it
+        every frame and aims at the crosshair, so moving to an absolute point
+        before pressing does not aim -- it *turns the player*, by whatever delta
+        happens to fall out of the difference. Mining, attacking and placing all
+        mean "press where I am already looking".
+
+        The hold is what makes it useful: breaking a block is a press sustained
+        for seconds, not a tap. Clamped, for the same reason a key hold is.
+        """
+        from gamelens.input import Button, ButtonDown, ButtonUp, Dwell
+
+        try:
+            btn = Button[str(button).strip().upper()]
+        except KeyError:
+            raise ActionRejected(
+                Rejection.OUT_OF_BOUNDS,
+                f"unknown button {button!r}; use left, right or middle",
+            )
+        hold = max(0.01, min(float(hold), MAX_BUTTON_HOLD))
+        return Action(
+            observation=observation,
+            steps=[ButtonDown(btn), Dwell(hold), ButtonUp(btn)],
+            label=f"{label}:{btn.name.lower()}",
+            source=source,
+        )
+
+    def look_action(
+        self,
+        observation: Observation,
+        dx: float,
+        dy: float,
+        *,
+        label: str = "look",
+        source: str = "agent",
+    ) -> Action:
+        """Turn the camera by a relative delta.
+
+        Clamped for the same reason as ``hold``: a pointer-locked game applies
+        the delta to its view angle directly, so a bad number does not land in
+        the wrong place on screen -- it spins the player round and there is no
+        coordinate check that would catch it, because there is no coordinate.
+        """
+        from gamelens.input import LookBy
+
+        import math
+
+        if not (math.isfinite(dx) and math.isfinite(dy)):
+            raise ActionRejected(Rejection.OUT_OF_BOUNDS, f"non-finite delta ({dx}, {dy})")
+        cdx = int(max(-MAX_LOOK_DELTA, min(MAX_LOOK_DELTA, dx)))
+        cdy = int(max(-MAX_LOOK_DELTA, min(MAX_LOOK_DELTA, dy)))
+        return Action(
+            observation=observation,
+            steps=[LookBy(cdx, cdy)],
+            label=f"{label}:{cdx:+d},{cdy:+d}",
             source=source,
         )
 

@@ -250,6 +250,30 @@ class Button(Enum):
     MIDDLE = (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)
 
 
+# Names a caller may use instead of a virtual-key code. An allowlist, not a
+# convenience: a caller that can name any VK can send Alt+F4, Ctrl+Alt+Del's
+# reachable parts, or the Windows key, none of which are "input to the game".
+# Anything outside this table is refused rather than translated.
+KEY_NAMES: dict[str, int] = {
+    **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
+    **{str(d): ord(str(d)) for d in range(10)},
+    "space": 0x20, "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
+    "shift": 0xA0, "ctrl": 0xA2, "alt": 0xA4,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "f1": 0x70, "f3": 0x72, "f5": 0x74,
+}
+
+
+def key_code(name: str) -> int:
+    """Resolve a key name to a virtual-key code, or refuse."""
+    vk = KEY_NAMES.get(str(name).strip().lower())
+    if vk is None:
+        raise ValueError(
+            f"unknown key {name!r}; allowed: {', '.join(sorted(KEY_NAMES))}"
+        )
+    return vk
+
+
 # --- action steps ---------------------------------------------------------
 
 
@@ -280,16 +304,34 @@ class KeyUp:
 
 
 @dataclass(frozen=True)
+class LookBy:
+    """A *relative* mouse move, in mickeys, for a game that has grabbed the cursor.
+
+    Absolute positioning is useless once a game captures the pointer: it hides
+    the cursor, re-centres it every frame and reads the delta, so a move to an
+    absolute screen point produces whatever delta happens to fall out of the
+    difference. Turning a camera means saying how far to turn.
+
+    The deltas pass through the pointer-speed and acceleration settings, so the
+    same numbers do not mean the same angle on two machines. That is a property
+    of the mechanism, not something to correct for here.
+    """
+
+    dx: int
+    dy: int
+
+
+@dataclass(frozen=True)
 class Dwell:
     seconds: float
 
 
-Step = MoveTo | ButtonDown | ButtonUp | KeyDown | KeyUp | Dwell
+Step = MoveTo | LookBy | ButtonDown | ButtonUp | KeyDown | KeyUp | Dwell
 
 # Steps that introduce *new* input. Every one of these is authorized inside the
 # dispatch boundary -- movement included, because a live cursor jump is itself an
 # intrusion on whatever the operator is doing.
-_NEW_INPUT_STEPS = (MoveTo, ButtonDown, KeyDown)
+_NEW_INPUT_STEPS = (MoveTo, LookBy, ButtonDown, KeyDown)
 
 # Steps that undo input we are already holding. These must be able to proceed
 # when the guard is denying everything, or a killed session leaves keys down.
@@ -619,6 +661,10 @@ class InputExecutor:
         """Inject one new input. Tracking is recorded only after a confirmed send."""
         if isinstance(step, MoveTo):
             _send(move_events(step.x, step.y, self._desktop_now()))
+        elif isinstance(step, LookBy):
+            # No ABSOLUTE flag: this is a delta, and it is the only kind of
+            # mouse input a pointer-locked game will interpret as a turn.
+            _send([_mouse_event(MOUSEEVENTF_MOVE, step.dx, step.dy)])
         elif isinstance(step, ButtonDown):
             _send([_mouse_event(step.button.value[0])])
             with self._lock:

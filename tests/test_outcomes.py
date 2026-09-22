@@ -272,7 +272,9 @@ def _dispatch_with(verdict, outcome):
     stand_in = type("R", (), {})()
     stand_in.log = ActionLog()
     stand_in.arbiter = _FakeArbiter(verdict, outcome)
-    action = type("A", (), {"action_id": 99})()
+    # `steps` matters: the wait budget is read off the action's own dwells, so
+    # a fake without them is not a stand-in for anything real.
+    action = type("A", (), {"action_id": 99, "steps": []})()
     result = GameLens._dispatch(stand_in, action, 10, 20, "probe", wait=0.5)
     return result, stand_in.log
 
@@ -314,3 +316,22 @@ def test_a_slow_executor_leaves_the_caller_with_pending_not_ok():
     result, log = _dispatch_with(Rejection.OK, None)   # outcome never arrives
     assert result.outcome == "pending"
     assert log.entries()[-1]["status"] == "queued", "still genuinely in the queue"
+
+
+def test_the_wait_budget_covers_the_action_s_own_length():
+    """A two-second key hold must not report "pending" for working correctly.
+
+    The budget is the queue allowance plus however long the action's own dwells
+    will take. Without that, every long press answers a question nobody asked:
+    truthfully, that no outcome arrived in 1.5s; uselessly, because it was never
+    going to.
+    """
+    from gamelens.app import DISPATCH_WAIT, _expected_duration
+    from gamelens.input import Dwell, KeyDown, KeyUp
+
+    action = type("A", (), {
+        "action_id": 1,
+        "steps": [KeyDown(0x57), Dwell(2.0), KeyUp(0x57)],
+    })()
+    assert _expected_duration(action) == 2.0
+    assert DISPATCH_WAIT + _expected_duration(action) > 2.0

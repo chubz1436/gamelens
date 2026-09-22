@@ -27,6 +27,17 @@ log = logging.getLogger(__name__)
 DISPATCH_WAIT = 1.5
 
 
+def _expected_duration(action) -> float:
+    """How long the action's own dwells will take, at minimum.
+
+    Read off the steps rather than assumed from the kind, so it stays right
+    when a new kind of action is added.
+    """
+    from gamelens.input import Dwell
+
+    return sum(s.seconds for s in action.steps if isinstance(s, Dwell))
+
+
 @dataclass(frozen=True)
 class Dispatch:
     """The two separate things a caller needs to know about one action.
@@ -272,8 +283,73 @@ class GameLens:
             return Dispatch("ERROR", "error", str(exc))
         return self._dispatch(action, x, y, label, wait=wait)
 
+    def submit_key(
+        self, *, observation_id: str, key: str, hold: float = 0.08,
+        label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+    ) -> Dispatch:
+        """Press one key in the image's world. See Arbiter.key_action."""
+        return self._submit_named(
+            observation_id, label or f"key {key}", source, wait,
+            lambda obs: self.arbiter.key_action(
+                obs, key, hold=hold, label=label or "key", source=source
+            ),
+        )
+
+    def submit_press(
+        self, *, observation_id: str, button: str = "left", hold: float = 0.08,
+        label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+    ) -> Dispatch:
+        """Hold a mouse button without moving. See Arbiter.press_action."""
+        return self._submit_named(
+            observation_id, label or f"press {button}", source, wait,
+            lambda obs: self.arbiter.press_action(
+                obs, button=button, hold=hold, label=label or "press", source=source
+            ),
+        )
+
+    def submit_look(
+        self, *, observation_id: str, dx: float, dy: float,
+        label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+    ) -> Dispatch:
+        """Turn the camera. See Arbiter.look_action."""
+        return self._submit_named(
+            observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait,
+            lambda obs: self.arbiter.look_action(
+                obs, dx, dy, label=label or "look", source=source
+            ),
+        )
+
+    def _submit_named(self, observation_id, label, source, wait, build) -> Dispatch:
+        """Shared path for actions that have no coordinate to draw or check.
+
+        A keystroke and a camera turn carry the same provenance rules as a
+        click -- the observation must still be the world that justified them --
+        but there is nothing to put on the overlay, so they get a log entry and
+        no mark.
+        """
+        observation = self.observations.resolve(observation_id)
+        if observation is None:
+            detail = f"observation {observation_id[:8]}... is unknown or expired"
+            self.log.add(f"{label}: {detail}", "denied")
+            return Dispatch(Rejection.STALE_OBSERVATION.name, "denied", detail)
+        try:
+            action = build(observation)
+        except ActionRejected as exc:
+            self.log.add(f"{label}: {exc}", "denied")
+            return Dispatch(exc.reason.name, "denied", str(exc))
+        except ValueError as exc:
+            # An unknown key name. A caller error, not a world that moved.
+            self.log.add(f"{label}: {exc}", "denied")
+            return Dispatch("BAD_REQUEST", "denied", str(exc))
+        except Exception as exc:
+            self.log.add(f"{label}: unexpected failure: {exc}", "error")
+            log.exception("%s failed", label)
+            return Dispatch("ERROR", "error", str(exc))
+        return self._dispatch(action, None, None, label, wait=wait)
+
     def _dispatch(
-        self, action, x: float, y: float, label: str, *, wait: float = 0.0
+        self, action, x: float | None, y: float | None, label: str,
+        *, wait: float = 0.0,
     ) -> Dispatch:
         """Submit an action and, optionally, wait to find out what became of it.
 
@@ -288,8 +364,10 @@ class GameLens:
         a hold -- and a caller that times out is told ``pending`` rather than a
         guess.
         """
-        entry_id = self.log.add(f"{label} at ({int(x)},{int(y)})", "queued")
-        self.log.mark(x, y, "queued", label, entry_id=entry_id)
+        where = f" at ({int(x)},{int(y)})" if x is not None and y is not None else ""
+        entry_id = self.log.add(f"{label}{where}", "queued")
+        if x is not None and y is not None:
+            self.log.mark(x, y, "queued", label, entry_id=entry_id)
 
         settled = threading.Event()
         box: list = []
@@ -307,7 +385,11 @@ class GameLens:
             return Dispatch(verdict.name, "denied", verdict.value, action.action_id)
 
         if wait > 0:
-            settled.wait(wait)
+            # The budget has to cover the action's own length, not just the
+            # queue. A click is ~200ms and fits; a key held for two seconds
+            # never would, so every long press would report "pending" while
+            # working perfectly -- the honest answer to the wrong question.
+            settled.wait(wait + _expected_duration(action))
         outcome = box[0] if box else None
         return Dispatch(
             "ok",

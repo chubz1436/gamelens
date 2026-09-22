@@ -316,13 +316,42 @@ def create_app(runtime) -> FastAPI:
         # executor to report what it did, and an `async def` that waits on a
         # threading primitive holds the whole server still while it does. The
         # first version of this blocked /stop for the length of every click.
+        kind = str(body.get("kind", "click")).lower()
+        label = str(body.get("label", "http"))
+        try:
+            if kind == "click":
+                call = dict(
+                    fn=runtime.submit_click,
+                    x=float(body["x"]), y=float(body["y"]),
+                )
+            elif kind == "key":
+                call = dict(
+                    fn=runtime.submit_key,
+                    key=str(body["key"]), hold=float(body.get("hold", 0.08)),
+                )
+            elif kind == "press":
+                call = dict(
+                    fn=runtime.submit_press,
+                    button=str(body.get("button", "left")),
+                    hold=float(body.get("hold", 0.08)),
+                )
+            elif kind == "look":
+                call = dict(
+                    fn=runtime.submit_look,
+                    dx=float(body["dx"]), dy=float(body["dy"]),
+                )
+            else:
+                raise HTTPException(400, f"unknown kind {kind!r}; use click, press, key or look")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(400, f"bad {kind} action: {exc}")
+
+        fn = call.pop("fn")
         result = await asyncio.to_thread(
-            runtime.submit_click,
+            fn,
             observation_id=str(observation_id),
-            x=float(body["x"]),
-            y=float(body["y"]),
-            label=str(body.get("label", "http")),
+            label=label,
             source=role,
+            **call,
         )
         payload = result.to_dict()
         if result.outcome == "error":
