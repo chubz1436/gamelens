@@ -194,6 +194,37 @@ def test_act_requires_an_observation_id(client, runtime):
     assert not runtime.submitted
 
 
+def test_a_malformed_settle_ms_is_refused_before_anything_is_injected(client, runtime):
+    """A bad duration must fail like a bad coordinate: early, and harmlessly.
+
+    The settle sleep happens after the input is injected, so validating it late
+    would mean answering a keystroke the game has already received with a 500 --
+    and a caller retrying that 500 presses the key a second time. The request
+    dies at the edge instead, with nothing submitted.
+    """
+    # Sent as raw bodies: NaN and Infinity are not JSON, but Python's parser
+    # accepts both literals, so a real client can put them on the wire and the
+    # server has to have an answer for them.
+    for bad in ('"soon"', "NaN", "Infinity", "-1e400"):
+        response = client.post(
+            "/act", headers={**agent(runtime), "Content-Type": "application/json"},
+            content=('{"observation_id": "abc123", "x": 10, "y": 20, '
+                     '"measure": true, "settle_ms": ' + bad + "}"),
+        )
+        assert response.status_code == 400, bad
+    assert not runtime.submitted
+
+
+def test_a_well_formed_settle_ms_is_accepted(client, runtime):
+    response = client.post(
+        "/act", headers=agent(runtime),
+        json={"observation_id": "abc123", "x": 10, "y": 20,
+              "measure": True, "settle_ms": 40},
+    )
+    assert response.status_code == 200
+    assert runtime.submitted
+
+
 def test_windows_listing_is_operator_only(client, runtime):
     assert client.get("/windows", headers=agent(runtime)).status_code == 403
     assert client.get("/windows", headers=op(runtime)).status_code == 200

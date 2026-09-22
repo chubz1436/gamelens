@@ -47,6 +47,11 @@ CHURN_SIZE = (64, 36)
 # come back -- so the comparison has to straddle the action, not overlap it.
 CHURN_SETTLE = 0.15
 
+# The widest settle a caller may ask for. The knob exists so a caller that knows
+# its target's animation timing can spend less than the default; it is not a way
+# to park a worker thread for a minute.
+MAX_SETTLE = 1.0
+
 
 def _expected_duration(action) -> float:
     """How long the action's own dwells will take, at minimum.
@@ -287,7 +292,7 @@ class GameLens:
     def submit_click(
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False,
+        measure: bool = False, settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
@@ -318,11 +323,12 @@ class GameLens:
             log.exception("submit_click failed for %r", label)
             return Dispatch("ERROR", "error", str(exc))
 
-        return self._dispatch(action, x, y, label, wait=wait, measure=measure)
+        return self._dispatch(action, x, y, label, wait=wait, measure=measure, settle=settle)
 
     def submit_observation_click(
         self, observation, x: float, y: float, *, label: str = "",
         source: str = "agent", wait: float = 0.0,
+        measure: bool = False, settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """In-process path: the caller already holds the observation it reasoned about.
 
@@ -330,6 +336,13 @@ class GameLens:
         had to be handed an id to know what it was looking at. ``wait`` defaults
         to zero here: an agent tier submitting from its own loop must not block
         on the input queue, and it learns the outcome from the next frame.
+
+        ``measure`` and ``settle`` are declared rather than inherited: this
+        method forwarded both to ``_dispatch`` without ever taking them, so
+        every successfully built click raised NameError before anything was
+        dispatched. It reached the reflex loop (agent.py) as a logged failure
+        and the vision tier as a dead worker, and no test crossed this path --
+        the HTTP surface uses ``submit_click``, which does take them.
         """
         try:
             action = self.arbiter.click_action(
@@ -343,16 +356,16 @@ class GameLens:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("submit_observation_click failed for %r", label)
             return Dispatch("ERROR", "error", str(exc))
-        return self._dispatch(action, x, y, label, wait=wait, measure=measure)
+        return self._dispatch(action, x, y, label, wait=wait, measure=measure, settle=settle)
 
     def submit_key(
         self, *, observation_id: str, key: str, hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False,
+        measure: bool = False, settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """Press one key in the image's world. See Arbiter.key_action."""
         return self._submit_named(
-            observation_id, label or f"key {key}", source, wait, measure,
+            observation_id, label or f"key {key}", source, wait, measure, settle,
             lambda obs: self.arbiter.key_action(
                 obs, key, hold=hold, label=label or "key", source=source
             ),
@@ -361,11 +374,11 @@ class GameLens:
     def submit_press(
         self, *, observation_id: str, button: str = "left", hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False,
+        measure: bool = False, settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """Hold a mouse button without moving. See Arbiter.press_action."""
         return self._submit_named(
-            observation_id, label or f"press {button}", source, wait, measure,
+            observation_id, label or f"press {button}", source, wait, measure, settle,
             lambda obs: self.arbiter.press_action(
                 obs, button=button, hold=hold, label=label or "press", source=source
             ),
@@ -374,17 +387,17 @@ class GameLens:
     def submit_look(
         self, *, observation_id: str, dx: float, dy: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False,
+        measure: bool = False, settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """Turn the camera. See Arbiter.look_action."""
         return self._submit_named(
-            observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait, measure,
+            observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait, measure, settle,
             lambda obs: self.arbiter.look_action(
                 obs, dx, dy, label=label or "look", source=source
             ),
         )
 
-    def _submit_named(self, observation_id, label, source, wait, measure, build) -> Dispatch:
+    def _submit_named(self, observation_id, label, source, wait, measure, settle, build) -> Dispatch:
         """Shared path for actions that have no coordinate to draw or check.
 
         A keystroke and a camera turn carry the same provenance rules as a
@@ -410,11 +423,12 @@ class GameLens:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("%s failed", label)
             return Dispatch("ERROR", "error", str(exc))
-        return self._dispatch(action, None, None, label, wait=wait, measure=measure)
+        return self._dispatch(action, None, None, label, wait=wait, measure=measure, settle=settle)
 
     def _dispatch(
         self, action, x: float | None, y: float | None, label: str,
         *, wait: float = 0.0, measure: bool = False,
+        settle: float = CHURN_SETTLE,
     ) -> Dispatch:
         """Submit an action and, optionally, wait to find out what became of it.
 
@@ -474,10 +488,10 @@ class GameLens:
             outcome.status if outcome else "pending",
             outcome.detail if outcome else "",
             action.action_id,
-            churn=self._churn_since(before, outcome),
+            churn=self._churn_since(before, outcome, settle),
         )
 
-    def _churn_since(self, before, outcome) -> float | None:
+    def _churn_since(self, before, outcome, settle: float) -> float | None:
         """How much the screen moved since ``before``, or None if unmeasurable.
 
         This answers "did anything change", which is the question GL-036 was
@@ -503,8 +517,23 @@ class GameLens:
         if before is None or outcome is None or outcome.status != "sent":
             # Nothing was injected, so the screen is not evidence about it.
             return None
-        time.sleep(CHURN_SETTLE)
         try:
+            # Clamped, and inside the guard. Both matter once the duration can
+            # come from a request: time.sleep() raises on a negative or
+            # non-finite argument, and this runs *after* the input was injected
+            # -- so an unguarded raise here would turn a keystroke the game has
+            # already received into an HTTP 500, and a caller that retries would
+            # send it twice. Instrumentation does not get to fail the action.
+            # OverflowError belongs here with the others: float(10**400) does
+            # not return inf, it raises -- and this runs after the key is in
+            # the game, where a raise is a 500 for an action that happened.
+            settle = min(MAX_SETTLE, max(0.0, float(settle)))
+        except (TypeError, ValueError, OverflowError):
+            settle = CHURN_SETTLE
+        if settle != settle:                      # NaN survives the comparisons
+            settle = CHURN_SETTLE
+        try:
+            time.sleep(settle)
             after = self._thumbnail()
         except Exception:
             log.debug("churn measurement failed", exc_info=True)
@@ -521,12 +550,16 @@ class GameLens:
 
     # --- state for the dashboard -------------------------------------------
 
-    def _fps(self) -> float:
-        times = list(self._frame_times)
-        if len(times) < 2:
-            return 0.0
-        span = times[-1] - times[0]
-        return (len(times) - 1) / span if span > 0 else 0.0
+    def _fps(self, capture: dict) -> float:
+        """The capture backend's own publication rate.
+
+        This used to be derived from `self._frame_times`, which `_watch` fills
+        at most once per 50ms iteration -- so the answer could never exceed 20
+        no matter how fast capture ran, and reported 16.0 for a backend
+        publishing 48.7 frames a second. The number now comes from the
+        publisher; the poller keeps its other jobs.
+        """
+        return round(float(capture.get("publish_rate", 0.0)), 1)
 
     def state(self) -> dict:
         capture = self.capture.stats()
@@ -553,7 +586,7 @@ class GameLens:
             "target": target,
             "capture": {
                 "backend": capture["backend"],
-                "fps": self._fps(),
+                "fps": self._fps(capture),
                 "age_ms": capture["age_ms"] if capture["age_ms"] != float("inf") else 9999,
                 "p95_age_ms": p95,
                 "frame_id": capture["frame_id"],

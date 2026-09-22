@@ -20,6 +20,7 @@ import itertools
 import logging
 import multiprocessing as mp
 import threading
+from collections import deque
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -58,6 +59,10 @@ WGC_BORDER_TOGGLE_SUPPORTED = (
 # escaped detection entirely. The cost was also misattributed; the crash that
 # prompted the throttle came from building a second capture session, not from
 # enumerating windows.
+
+# How many publication timestamps to keep for the rate. Two seconds at 60fps,
+# so the figure reacts quickly without a poller's aliasing.
+PUBLISH_RATE_WINDOW = 120
 
 # How long a backend may go without producing a distinct frame before it is
 # considered unhealthy and replaced.
@@ -328,6 +333,13 @@ class CaptureBackend:
         self.session_id = next(_session_ids)
         self.distinct = 0
         self.duplicates = 0
+        # Publication timestamps, for the rate. Owned by the publisher because
+        # a rate derived by a poller can only ever report the poller's own
+        # frequency: GL-037 was /state reporting 16fps for a backend publishing
+        # 48.7, because the sampler ran at 20Hz and counted its own iterations.
+        # A deque here also has no cross-backend state to corrupt -- `distinct`
+        # restarts at zero on a swap, so a delta spanning one goes negative.
+        self._published_at: deque[float] = deque(maxlen=PUBLISH_RATE_WINDOW)
         self.last_frame_at = 0.0
         self.activated_at = time.monotonic()
         self.error: str | None = None
@@ -361,6 +373,21 @@ class CaptureBackend:
             # backend blocked inside its first call looks like.
             return (time.monotonic() - self.activated_at) <= FIRST_FRAME_DEADLINE
         return (time.monotonic() - self.last_frame_at) <= deadline
+
+    def publish_rate(self) -> float:
+        """Frames published per second over the recent window.
+
+        Frames *published*, which is not the same as distinct scenes: only the
+        WGC backend carries a native timespan that `_publish` can deduplicate
+        against, so for mss and PrintWindow every capture attempt publishes even
+        when the pixels are identical. This number is honest about throughput
+        and says nothing about content.
+        """
+        times = list(self._published_at)
+        if len(times) < 2:
+            return 0.0
+        span = times[-1] - times[0]
+        return (len(times) - 1) / span if span > 0 else 0.0
 
     def _publish(self, array: np.ndarray, timespan: int) -> bool:
         """Copy into a pooled buffer and publish. Returns False if dropped.
@@ -404,6 +431,7 @@ class CaptureBackend:
                 return False
             self.sink.publish(frame)
             self.distinct += 1
+            self._published_at.append(frame.captured_at)
             self.last_frame_at = frame.captured_at
         return True
 
@@ -852,6 +880,7 @@ class CaptureSupervisor:
                 "session_id": backend.session_id if backend else 0,
                 "healthy": backend.healthy(self.deadline) if backend else False,
                 "distinct": backend.distinct if backend else 0,
+                "publish_rate": backend.publish_rate() if backend else 0.0,
                 "duplicates": backend.duplicates if backend else 0,
                 "error": backend.error if backend else None,
                 "frame_id": frame.frame_id if frame else 0,

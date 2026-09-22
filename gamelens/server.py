@@ -10,6 +10,7 @@ live; an agent can only propose actions.
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import secrets
 import threading
@@ -332,7 +333,18 @@ def create_app(runtime) -> FastAPI:
         # first version of this blocked /stop for the length of every click.
         kind = str(body.get("kind", "click")).lower()
         label = str(body.get("label", "http"))
+        # Parsed and validated here, with the other numeric fields, because a
+        # malformed duration has to fail the request *before* anything is
+        # injected. Raising later -- after the game already has the keystroke --
+        # would turn a delivered action into a 500 and invite a retry that
+        # sends it twice.
+        extra: dict = {}
         try:
+            if "settle_ms" in body and body["settle_ms"] is not None:
+                settle = float(body["settle_ms"]) / 1000.0
+                if not math.isfinite(settle):
+                    raise ValueError("settle_ms must be finite")
+                extra["settle"] = settle
             if kind == "click":
                 call = dict(
                     fn=runtime.submit_click,
@@ -356,7 +368,11 @@ def create_app(runtime) -> FastAPI:
                 )
             else:
                 raise HTTPException(400, f"unknown kind {kind!r}; use click, press, key or look")
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            # OverflowError is in the list because JSON has no float limit: an
+            # integer literal with four hundred zeros is valid JSON and a valid
+            # Python int, and float() raises on it rather than returning inf.
+            # Without this it is a 500 for a request the caller can see is bad.
             raise HTTPException(400, f"bad {kind} action: {exc}")
 
         fn = call.pop("fn")
@@ -370,6 +386,7 @@ def create_app(runtime) -> FastAPI:
             # whether its actions are landing wants that; a caller running a
             # reflex loop at forty actions a second does not.
             measure=bool(body.get("measure", False)),
+            **extra,
             **call,
         )
         payload = result.to_dict()
