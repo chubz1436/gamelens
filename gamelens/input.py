@@ -203,9 +203,12 @@ def move_events(x: int, y: int, desktop: VirtualDesktop | None = None) -> list[I
     executed, and the target's own screen is the only thing that disagrees.
 
     So when the cursor is already there, step one pixel aside first. Both events
-    go in a single SendInput call, so no application can observe the cursor
-    resting on the neighbour, and the neighbour is chosen inside the virtual
-    desktop so normalization cannot reject it.
+    go in a single SendInput call, which is documented not to interleave any
+    other thread's input between them -- the target sees two moves back to back
+    and never a pointer parked on the neighbour with something else in front of
+    it. The neighbour is chosen inside the virtual desktop so normalization
+    cannot reject it, and skipped if it rounds to the same normalized pair,
+    because that would be suppressed for the very same reason.
     """
     vd = desktop or virtual_desktop()
     nx, ny = normalize_absolute(x, y, vd)

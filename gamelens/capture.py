@@ -102,6 +102,19 @@ class FramePool:
     """
 
     def __init__(self, depth: int = 4) -> None:
+        """
+        Four was originally a guess. It is now a measurement: four concurrent
+        HTTP clients pulling frames as fast as the server would serve them --
+        1750 fetches in 8 seconds, on top of the poller and the geometry thread
+        -- exhausted the pool zero times while capture advanced 575 frames.
+
+        Leases are short by design; every consumer takes one, copies or encodes,
+        and releases. What would actually require more depth is a consumer that
+        *holds* a frame across something slow, and the one place that was
+        tempted to -- the vision tier, across a model call -- deliberately does
+        not. Raise it if you add one that does; `exhausted` in the dashboard is
+        how you would know.
+        """
         self.depth = depth
         self._free: list[_Buffer] = []
         self._live = 0

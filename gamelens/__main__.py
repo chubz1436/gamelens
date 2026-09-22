@@ -37,6 +37,23 @@ def _print_windows() -> int:
     return 0
 
 
+def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """Can we actually bind? Asked before anything expensive starts.
+
+    No SO_REUSEADDR: the question is whether uvicorn will succeed in a moment,
+    and reusing the address here would answer a different, more optimistic
+    question than the one that matters.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="gamelens",
@@ -80,6 +97,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except LookupError as exc:
         print(exc, file=sys.stderr)
+        return 2
+
+    if not _port_is_free(args.port):
+        # Checked here rather than left to uvicorn. Binding is the *last* thing
+        # that happens, so a busy port meant capture had already started, a
+        # worker process had been spawned and a fresh pair of one-time tokens
+        # had been printed -- for a server that then exited without ever
+        # listening. The tokens are the part that matters: a console full of
+        # credentials that belong to nothing is how the wrong one gets pasted.
+        print(
+            f"refusing to start: port {args.port} is already in use.\n"
+            f"Another GameLens is probably still running -- note that the kill "
+            f"switch latches the process rather than stopping it, so a killed "
+            f"session still holds the port. Stop it, or pass --port.",
+            file=sys.stderr,
+        )
         return 2
 
     lens = GameLens(

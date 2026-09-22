@@ -105,6 +105,23 @@ When a reflex fires it **preempts** the vision tier: whatever the model is curre
 reasoning about has just been invalidated by the reflex's own action, so its answer is
 discarded on arrival.
 
+## Decisions, and the reasons
+
+These were open questions during the build. They are answered, not deferred.
+
+- **GameLens will not launch itself elevated.** UIPI blocks injection into a window owned by an
+  elevated process, and the obvious fix — run GameLens elevated too — buys one target and gives
+  away the boundary. An elevated injector can drive UAC prompts, security dialogs and every
+  other window on the desktop, so a coordinate bug stops being a misclick in a game. The
+  current behaviour is a `SendInput` short count, which fails closed and says exactly why.
+- **The session tokens stay on the console.** Two secrets, printed once, for one operator on
+  one machine, over loopback. Anything that makes them reachable from another device needs a
+  transport that is actually authenticated, not a longer token — so that is the change to make
+  if it is ever wanted, rather than widening this.
+- **The buffer pool depth stays at 4.** Measured rather than assumed: four concurrent clients
+  pulling as fast as the server would serve, 1750 fetches in 8 seconds, zero exhaustion. Leases
+  are short everywhere by design, including across the model call.
+
 ## Known limitations
 
 These are real and not worked around:
@@ -146,9 +163,20 @@ These are real and not worked around:
 per-thread DPI, the observation registry and transport scaling, the HTTP boundary, and the
 outcome reporting that tells acceptance apart from execution.
 
-**What tests cannot establish:** that a click actually hit a button. Three acceptance
-criteria — the coordinate round-trip on a negative-origin monitor, kill-during-dwell, and
-dry-run overlay accuracy — need a real game window and a person at the machine.
+**What tests cannot establish:** that a click actually hit a button. Those were run against
+a real game rather than asserted:
+
+- **Kill during a dwell.** The cursor arrived on the button, the kill landed inside the settle,
+  `/act` returned `409 {"outcome":"denied","detail":"kill switch latched"}`, the executor showed
+  `executed 1 / denied 1`, and the game stayed on the menu it was on. Also covered by
+  `tests/test_killswitch.py`, including the hotkey path itself — a real key event through
+  `SendInput`, picked up by the watchdog's `GetAsyncKeyState` poll.
+- **Dry-run overlay accuracy.** The overlay crosshair landed on the button the agent meant.
+
+Still open, and it needs hardware rather than effort: the coordinate round-trip on a
+**negative-origin monitor**. `tools/coord_probe.py` is the one command to run when a display
+sits left of or above the primary; it reports zero error here and says plainly that a
+single-monitor run cannot prove the case.
 
 ## Acting on a frame over HTTP
 

@@ -195,18 +195,26 @@ def create_app(runtime) -> FastAPI:
         return HTMLResponse(html)
 
     # --- read paths -------------------------------------------------------
+    #
+    # Everything below that touches Win32, the buffer pool or an encoder is a
+    # plain `def`, not `async def`. FastAPI runs a sync endpoint in a worker
+    # thread; an `async def` that blocks runs *on the event loop* and stops the
+    # server answering anything else while it does. That is not a throughput
+    # concern here -- it is the Stop button. Measured before this changed: a
+    # /state issued 50ms into an /act took 159ms, because it was waiting for
+    # the click sequence to finish.
 
     @app.get("/state")
-    async def state(role: str = Depends(any_role)) -> JSONResponse:
+    def state(role: str = Depends(any_role)) -> JSONResponse:
         return JSONResponse(runtime.state())
 
     @app.get("/windows")
-    async def windows(role: str = Depends(operator_only)) -> JSONResponse:
+    def windows(role: str = Depends(operator_only)) -> JSONResponse:
         from gamelens.windows import list_windows
         return JSONResponse([w.to_dict() for w in list_windows()])
 
     @app.get("/frame.jpg")
-    async def frame_jpg(quality: int = 70, role: str = Depends(any_role)) -> Response:
+    def frame_jpg(quality: int = 70, role: str = Depends(any_role)) -> Response:
         jpeg, observation_id = runtime.encode_latest(quality=quality)
         if jpeg is None:
             raise HTTPException(503, "no frame available yet")
@@ -225,7 +233,12 @@ def create_app(runtime) -> FastAPI:
         async def frames():
             last_id = ""
             while True:
-                jpeg, observation_id = runtime.encode_latest(quality=quality)
+                # Off the loop: this acquires a pool buffer and JPEG-encodes it.
+                # A 3441x1440 frame is tens of milliseconds, every frame, and
+                # the stream is the one endpoint that runs continuously.
+                jpeg, observation_id = await asyncio.to_thread(
+                    runtime.encode_latest, quality
+                )
                 if jpeg is not None and observation_id != last_id:
                     last_id = observation_id
                     # Each part names the observation it is, so a consumer
@@ -248,19 +261,26 @@ def create_app(runtime) -> FastAPI:
     # --- control paths ----------------------------------------------------
 
     @app.post("/arm")
-    async def arm(role: str = Depends(operator_only)) -> JSONResponse:
+    def arm(role: str = Depends(operator_only)) -> JSONResponse:
         runtime.safety.arm()
         runtime.log.add("ARMED (still dry-run)", "dry")
         return JSONResponse(runtime.state())
 
     @app.post("/live")
-    async def live(role: str = Depends(operator_only)) -> JSONResponse:
+    def live(role: str = Depends(operator_only)) -> JSONResponse:
         runtime.safety.go_live()
         runtime.log.add("LIVE -- input will be injected", "sent")
         return JSONResponse(runtime.state())
 
     @app.post("/stop")
-    async def stop(role: str = Depends(operator_only)) -> JSONResponse:
+    def stop(role: str = Depends(operator_only)) -> JSONResponse:
+        """The one endpoint whose latency is a safety property.
+
+        Sync on purpose, so it is served from a worker thread. It also takes the
+        dispatch boundary and runs the release callbacks, which reach SendInput
+        -- none of that belongs on the loop that has to stay free to accept the
+        request in the first place.
+        """
         runtime.safety.kill("dashboard stop")
         runtime.log.add("STOPPED by operator", "denied")
         return JSONResponse(runtime.state())
@@ -292,7 +312,12 @@ def create_app(runtime) -> FastAPI:
                 "observation_id is required; it is returned with every image in "
                 "the X-GameLens-Observation header",
             )
-        result = runtime.submit_click(
+        # Off the loop. This one waits -- up to DISPATCH_WAIT -- for the
+        # executor to report what it did, and an `async def` that waits on a
+        # threading primitive holds the whole server still while it does. The
+        # first version of this blocked /stop for the length of every click.
+        result = await asyncio.to_thread(
+            runtime.submit_click,
             observation_id=str(observation_id),
             x=float(body["x"]),
             y=float(body["y"]),
