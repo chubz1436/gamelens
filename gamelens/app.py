@@ -10,6 +10,9 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 
+import cv2
+import numpy as np
+
 from gamelens.arbiter import ActionRejected, Arbiter, Rejection
 from gamelens.capture import Backend, CaptureSupervisor
 from gamelens.coords import GeometryTracker
@@ -25,6 +28,24 @@ log = logging.getLogger(__name__)
 # this covers the normal case with room for a shallow queue, and a caller that
 # outlasts it is told "pending" rather than handed a guess.
 DISPATCH_WAIT = 1.5
+
+# Mean absolute difference, 0-255, below which a thumbnail pair is called still.
+# JPEG-free (the thumbnail comes off the raw frame) so the floor only has to
+# clear sensor-level jitter, not compression noise.
+CHURN_FLOOR = 1.0
+
+# The thumbnail is small on purpose: the question is "did the screen move",
+# which survives aggressive downscaling, and the measurement sits inside the
+# dispatch path where cost is latency.
+CHURN_SIZE = (64, 36)
+
+# Sampled this long after the executor finishes, not at the moment it finishes.
+# During a mining hold the game animates cracks on the block, so the screen is
+# busy for the whole action whether or not anything breaks; comparing across the
+# action therefore reports motion in both cases and separates nothing. After the
+# button releases the transient ends -- cracks vanish, a broken block does not
+# come back -- so the comparison has to straddle the action, not overlap it.
+CHURN_SETTLE = 0.15
 
 
 def _expected_duration(action) -> float:
@@ -57,11 +78,23 @@ class Dispatch:
     outcome: str
     detail: str = ""
     action_id: int | None = None
+    churn: float | None = None
 
     @property
     def ok(self) -> bool:
         """True only when the action was accepted *and* not refused afterwards."""
         return self.verdict == "ok" and self.outcome in ("sent", "dry", "pending")
+
+    @property
+    def changed_anything(self) -> bool | None:
+        """Whether the screen moved at all across the action, or None if unmeasured.
+
+        Deliberately not folded into ``ok``. This is evidence about the world,
+        not a verdict about the action, and the two must not be confused: a
+        correct action can leave the screen still -- walking into a wall -- and
+        a refused one can sit in front of a screen full of falling rain.
+        """
+        return None if self.churn is None else self.churn >= CHURN_FLOOR
 
     def to_dict(self) -> dict:
         return {
@@ -69,6 +102,7 @@ class Dispatch:
             "outcome": self.outcome,
             "detail": self.detail,
             "action_id": self.action_id,
+            "churn": self.churn,
         }
 
 
@@ -200,6 +234,33 @@ class GameLens:
 
     # --- frames -----------------------------------------------------------
 
+    def _thumbnail(self) -> "np.ndarray | None":
+        """A tiny greyscale copy of the newest frame, or None if there is none.
+
+        The copy matters. Frames are leased from a refcounted pool and the
+        buffer is reused the moment the lease is released, so anything kept
+        beyond the ``finally`` would be silently overwritten by a later frame --
+        and a before/after comparison against a buffer that has become the
+        after would read as no change at all.
+        """
+        try:
+            frame = self.capture.frames.acquire()
+        except Exception:
+            log.debug("thumbnail: no capture to sample", exc_info=True)
+            return None
+        if frame is None:
+            return None
+        try:
+            small = cv2.resize(
+                frame.array[:, :, :3], CHURN_SIZE, interpolation=cv2.INTER_AREA
+            )
+            return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        except Exception:
+            log.debug("thumbnail failed", exc_info=True)
+            return None
+        finally:
+            frame.release()
+
     def encode_latest(self, quality: int = 70) -> tuple[bytes | None, str]:
         """Encode the newest frame and register what was handed out.
 
@@ -226,6 +287,7 @@ class GameLens:
     def submit_click(
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False,
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
@@ -256,7 +318,7 @@ class GameLens:
             log.exception("submit_click failed for %r", label)
             return Dispatch("ERROR", "error", str(exc))
 
-        return self._dispatch(action, x, y, label, wait=wait)
+        return self._dispatch(action, x, y, label, wait=wait, measure=measure)
 
     def submit_observation_click(
         self, observation, x: float, y: float, *, label: str = "",
@@ -281,15 +343,16 @@ class GameLens:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("submit_observation_click failed for %r", label)
             return Dispatch("ERROR", "error", str(exc))
-        return self._dispatch(action, x, y, label, wait=wait)
+        return self._dispatch(action, x, y, label, wait=wait, measure=measure)
 
     def submit_key(
         self, *, observation_id: str, key: str, hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False,
     ) -> Dispatch:
         """Press one key in the image's world. See Arbiter.key_action."""
         return self._submit_named(
-            observation_id, label or f"key {key}", source, wait,
+            observation_id, label or f"key {key}", source, wait, measure,
             lambda obs: self.arbiter.key_action(
                 obs, key, hold=hold, label=label or "key", source=source
             ),
@@ -298,10 +361,11 @@ class GameLens:
     def submit_press(
         self, *, observation_id: str, button: str = "left", hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False,
     ) -> Dispatch:
         """Hold a mouse button without moving. See Arbiter.press_action."""
         return self._submit_named(
-            observation_id, label or f"press {button}", source, wait,
+            observation_id, label or f"press {button}", source, wait, measure,
             lambda obs: self.arbiter.press_action(
                 obs, button=button, hold=hold, label=label or "press", source=source
             ),
@@ -310,16 +374,17 @@ class GameLens:
     def submit_look(
         self, *, observation_id: str, dx: float, dy: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False,
     ) -> Dispatch:
         """Turn the camera. See Arbiter.look_action."""
         return self._submit_named(
-            observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait,
+            observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait, measure,
             lambda obs: self.arbiter.look_action(
                 obs, dx, dy, label=label or "look", source=source
             ),
         )
 
-    def _submit_named(self, observation_id, label, source, wait, build) -> Dispatch:
+    def _submit_named(self, observation_id, label, source, wait, measure, build) -> Dispatch:
         """Shared path for actions that have no coordinate to draw or check.
 
         A keystroke and a camera turn carry the same provenance rules as a
@@ -345,11 +410,11 @@ class GameLens:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("%s failed", label)
             return Dispatch("ERROR", "error", str(exc))
-        return self._dispatch(action, None, None, label, wait=wait)
+        return self._dispatch(action, None, None, label, wait=wait, measure=measure)
 
     def _dispatch(
         self, action, x: float | None, y: float | None, label: str,
-        *, wait: float = 0.0,
+        *, wait: float = 0.0, measure: bool = False,
     ) -> Dispatch:
         """Submit an action and, optionally, wait to find out what became of it.
 
@@ -368,6 +433,19 @@ class GameLens:
         entry_id = self.log.add(f"{label}{where}", "queued")
         if x is not None and y is not None:
             self.log.mark(x, y, "queued", label, entry_id=entry_id)
+
+        # Sampled before submission and again after the outcome settles. Only
+        # when the caller is already waiting: taking an "after" the action has
+        # not finished would compare the screen to itself and call every action
+        # ineffective.
+        try:
+            before = self._thumbnail() if measure else None
+        except Exception:
+            # An action must never fail because the thing watching it did. This
+            # is a measurement bolted onto the dispatch path, and the dispatch
+            # path is the one that presses buttons in somebody's game.
+            log.debug("churn baseline failed", exc_info=True)
+            before = None
 
         settled = threading.Event()
         box: list = []
@@ -396,7 +474,44 @@ class GameLens:
             outcome.status if outcome else "pending",
             outcome.detail if outcome else "",
             action.action_id,
+            churn=self._churn_since(before, outcome),
         )
+
+    def _churn_since(self, before, outcome) -> float | None:
+        """How much the screen moved since ``before``, or None if unmeasurable.
+
+        This answers "did anything change", which is the question GL-036 was
+        opened for: an action can be injected perfectly and accomplish nothing,
+        and until now the two were indistinguishable from outside -- a mining
+        hold shorter than the block's own break time returned ``sent`` a hundred
+        and sixty times without breaking a single block.
+
+        It is evidence, not proof, and in both directions. Rain, a passing mob
+        or a sunrise move pixels on their own, so a high number does not mean
+        the action worked; and walking into a wall changes nothing on screen,
+        so a low one does not mean it failed.
+
+        The sampling straddles the action rather than spanning it, which is the
+        whole reason it can say anything at all. Measured across the action, a
+        mining hold reports motion either way, because the game animates cracks
+        on the block for as long as the button is down; the first version of
+        this measurement did exactly that and could not have caught the defect
+        it was written for. Measured from before the action to after the screen
+        has settled, the transient is gone and what remains is what actually
+        changed.
+        """
+        if before is None or outcome is None or outcome.status != "sent":
+            # Nothing was injected, so the screen is not evidence about it.
+            return None
+        time.sleep(CHURN_SETTLE)
+        try:
+            after = self._thumbnail()
+        except Exception:
+            log.debug("churn measurement failed", exc_info=True)
+            return None
+        if after is None or after.shape != before.shape:
+            return None
+        return round(float(np.abs(after - before).mean()), 3)
 
     def attach_agent(self, agent) -> None:
         self.agent = agent

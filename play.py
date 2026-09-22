@@ -31,15 +31,28 @@ def req(path, token, method="GET", body=None):
 
 
 def focus():
+    """Bring the game forward, and keep trying if Windows says no.
+
+    SetForegroundWindow is refused outright when this process does not hold the
+    foreground right -- it returns an error rather than doing nothing quietly.
+    A minimize/restore cycle is the fallback that actually works, because
+    restoring a window is an activation Windows will grant.
+    """
     if win32gui.GetForegroundWindow() == HWND:
         return True
-    win32gui.ShowWindow(HWND, win32con.SW_RESTORE)
-    try:
-        win32gui.SetForegroundWindow(HWND)
-    except Exception:
-        pass
-    time.sleep(0.35)
-    return win32gui.GetForegroundWindow() == HWND
+    for attempt in range(3):
+        try:
+            win32gui.ShowWindow(HWND, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(HWND)
+        except Exception:
+            if attempt:                       # escalate only after a plain try
+                win32gui.ShowWindow(HWND, win32con.SW_MINIMIZE)
+                time.sleep(0.15)
+                win32gui.ShowWindow(HWND, win32con.SW_RESTORE)
+        time.sleep(0.3)
+        if win32gui.GetForegroundWindow() == HWND:
+            return True
+    return False
 
 
 def act(ag, **body):
@@ -48,7 +61,14 @@ def act(ag, **body):
     body["observation_id"] = h.get("x-gamelens-observation")
     st, raw, _ = req("/act", ag, "POST", body)
     r = json.loads(raw)
-    return f"{r['verdict']}/{r['outcome']}" + (f" ({r['detail']})" if r.get("detail") else "")
+    out = f"{r['verdict']}/{r['outcome']}"
+    if r.get("detail"):
+        out += f" ({r['detail']})"
+    if r.get("churn") is not None:
+        # Whether the screen moved at all. A run of zeros means the actions are
+        # landing and accomplishing nothing, which used to look like success.
+        out += f"  churn {r['churn']:.2f}"
+    return out
 
 
 def shot(name, op):
@@ -79,6 +99,8 @@ def run_step(ag, text):
     if kind == "wait":
         time.sleep(float(parts[1]))
         return "slept"
+    if kind == "shot":
+        return "-> " + shot(parts[1], tokens()[0])
     raise SystemExit(f"unknown step {text!r}")
 
 
@@ -91,7 +113,7 @@ if __name__ == "__main__":
         print("shot:", shot(sys.argv[2], op))
     elif cmd == "seq":
         for step in [s.strip() for s in sys.argv[2].split(";") if s.strip()]:
-            print(f"  {step:<24} -> {run_step(ag, step)}", flush=True)
+            print(f"  {step:<26} {run_step(ag, step)}", flush=True)
         if len(sys.argv) > 3:
             time.sleep(float(sys.argv[4]) if len(sys.argv) > 4 else 0.6)
             print("  shot:", shot(sys.argv[3], op), flush=True)

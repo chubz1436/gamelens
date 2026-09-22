@@ -269,9 +269,16 @@ def _dispatch_with(verdict, outcome):
     from gamelens.app import GameLens
     from gamelens.server import ActionLog
 
-    stand_in = type("R", (), {})()
+    # Built from GameLens itself rather than a bare object wearing its name.
+    # A hand-rolled stand-in only has the attributes someone remembered to add,
+    # so it stops being a stand-in the moment _dispatch touches anything new --
+    # which is exactly what happened when effect measurement landed there.
+    stand_in = object.__new__(GameLens)
     stand_in.log = ActionLog()
     stand_in.arbiter = _FakeArbiter(verdict, outcome)
+    # No frames: these tests are about reporting, not about the screen.
+    stand_in.capture = type("C", (), {"frames": type("P", (), {
+        "acquire": lambda self, timeout=None: None})()})()
     # `steps` matters: the wait budget is read off the action's own dwells, so
     # a fake without them is not a stand-in for anything real.
     action = type("A", (), {"action_id": 99, "steps": []})()

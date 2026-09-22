@@ -7,3 +7,31 @@ __pycache__/
 # purpose: they hardcode an HWND and a token path and are rewritten every run.
 _live.py
 _play.py
+
+# One-shot scripts written while driving the demo and superseded as fast as they
+# were written -- several encode rules the game itself refuted. Same reason as
+# the drivers above: they are rewritten every run and are not worth history.
+chew.py
+chop.py
+climb.py
+climb2.py
+descend.py
+diag.py
+eye.py
+fell.py
+fell2.py
+final.py
+getwood.py
+gl036.py
+gl036b.py
+gl036c.py
+logs.py
+look.py
+look4.py
+plant.py
+survey.py
+survey2.py
+tree.py
+walkchop.py
+wood2.py
+wood3.py

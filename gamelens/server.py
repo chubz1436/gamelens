@@ -303,6 +303,20 @@ def create_app(runtime) -> FastAPI:
         told the queue took it, not that the game saw it. The request waits
         briefly for the real answer; ``"outcome": "pending"`` means it did not
         arrive in time, never that it succeeded.
+
+        ``churn`` is a third thing, and weaker on purpose: how much the screen
+        differs from before the action once it has settled afterwards, or null
+        when it was not measured. It straddles the action rather than spanning
+        it, because a game animates feedback for as long as a button is held --
+        so a comparison taken *during* an action reports motion whether or not
+        anything came of it. It is there
+        because "injected correctly" and "had any effect" are different
+        questions, and a caller that can only see the first cannot tell a
+        working action from a mining hold shorter than the block's break time.
+        It is evidence rather than a verdict -- rain moves pixels on its own,
+        and walking into a wall moves none -- so it never decides the status
+        code. It is null unless the request asks for it with ``"measure": true``,
+        because obtaining it means waiting for the screen to settle afterwards.
         """
         body = await request.json()
         observation_id = body.get("observation_id")
@@ -351,6 +365,11 @@ def create_app(runtime) -> FastAPI:
             observation_id=str(observation_id),
             label=label,
             source=role,
+            # Opt-in: the effect measurement waits for the screen to settle, so
+            # it costs roughly 150ms on top of the action. A caller checking
+            # whether its actions are landing wants that; a caller running a
+            # reflex loop at forty actions a second does not.
+            measure=bool(body.get("measure", False)),
             **call,
         )
         payload = result.to_dict()
