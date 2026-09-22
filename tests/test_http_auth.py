@@ -225,6 +225,35 @@ def test_a_well_formed_settle_ms_is_accepted(client, runtime):
     assert runtime.submitted
 
 
+def test_a_click_can_name_its_button(client, runtime):
+    """A left click cannot craft.
+
+    Minecraft's inventory splits a stack with the right button -- left places
+    the whole stack, right places one -- so an agent that can only left-click
+    can shuffle items around a grid but cannot put one plank in each of four
+    slots, which is the first recipe in the game.
+    """
+    response = client.post(
+        "/act", headers=agent(runtime),
+        json={"observation_id": "abc123", "x": 10, "y": 20, "button": "right"},
+    )
+    assert response.status_code == 200
+    assert runtime.submitted[-1].get("button") == "right"
+
+
+def test_an_unknown_button_is_refused_rather_than_assumed(client, runtime):
+    """A typo must not quietly become a left click.
+
+    The difference between the buttons is the difference between moving a stack
+    and splitting it, and between mining a block and placing one.
+    """
+    response = client.post(
+        "/act", headers=agent(runtime),
+        json={"observation_id": "abc123", "x": 10, "y": 20, "button": "rigth"},
+    )
+    assert response.status_code == 400
+
+
 def test_windows_listing_is_operator_only(client, runtime):
     assert client.get("/windows", headers=agent(runtime)).status_code == 403
     assert client.get("/windows", headers=op(runtime)).status_code == 200

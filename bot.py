@@ -395,6 +395,114 @@ def place():
     return act(kind="press", button="right", hold=0.08, label="bot-place")
 
 
+def click(x, y, button="left", label="gui", in_menu=True):
+    """Click a point in the frame. In a menu by default, because that is where
+    a coordinate click is usually wanted -- `resume()` would close the screen
+    being driven."""
+    return act(in_menu=in_menu, kind="click", x=int(x), y=int(y),
+               button=button, label=label)
+
+
+# Minecraft's inventory is a 176x166 texture drawn at an integer scale, and
+# every slot sits at a fixed offset inside it. So rather than remembering nine
+# pixel coordinates -- which was finding GL037-I8 all over again, since the
+# scale changes with the window and the GUI Scale setting -- find the panel in
+# the frame and compute the slots from it.
+#
+# Offsets are the texture's own, in GUI units, of the slot's top-left corner.
+GUI_W, GUI_H = 176, 166
+G_HOTBAR = (8, 142)
+G_INV = (8, 84)                  # first of the three 9-wide rows
+G_CRAFT2 = (98, 18)              # the 2x2 grid in the player's own inventory
+G_CRAFT2_OUT = (154, 28)
+G_PITCH = 18
+
+
+def gui_panel(arr):
+    """(x0, y0, scale) of the open inventory panel, or None if none is open.
+
+    Two earlier versions of this failed in ways worth keeping in the comment.
+    Taking the first and last column of light grey stretched the panel across
+    the whole screen as soon as the F3 overlay was up, because that overlay is
+    light grey text everywhere. Taking the longest *unbroken* run then failed on
+    the panel itself, whose background is interrupted by its own slots -- the
+    slots are a darker grey, so a column crossing the grid has very little of
+    the lighter one.
+
+    So look for the shape instead: everything unsaturated and mid-bright,
+    slot grey and background grey together, closed up and taken as one blob.
+    The panel is the largest such thing on screen by a wide margin, and the
+    world behind it is dimmed while it is open.
+    """
+    if arr is None:
+        return None
+    b = arr[:, :, 0].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    r = arr[:, :, 2].astype(np.int16)
+    mask = (((abs(b - g) < 14) & (abs(g - r) < 14) & (b > 110) & (b < 240))
+            .astype(np.uint8))
+    # Open before closing: the F3 overlay is one-pixel-stroke text that the
+    # closing would otherwise weld to the panel, and the merged blob's bounding
+    # box is then neither the panel nor anything else. Erosion erases strokes
+    # that thin and leaves a 344px slab untouched.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count < 2:
+        return None
+    # stats[0] is the background component.
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x0, y0, w, h, area = stats[i]
+    if w < 80 or h < 80 or area < 0.6 * w * h:
+        return None
+    scale = w / GUI_W
+    if not (1.0 < scale < 12.0):
+        return None
+    # The panel is 176x166. Anything a long way off that shape is something
+    # else, and clicking inside it would be clicking at random.
+    if abs(h / scale - GUI_H) > 24:
+        return None
+    return int(x0), int(y0), scale
+
+
+# The crafting table's own screen, same texture size, different offsets.
+G_CRAFT3 = (30, 17)              # the 3x3 grid's first slot
+G_CRAFT3_OUT = (124, 35)
+
+
+def gpoint(panel, gx, gy):
+    """The centre of the slot whose texture corner is (gx, gy)."""
+    x0, y0, scale = panel
+    return int(x0 + scale * (gx + 8)), int(y0 + scale * (gy + 8))
+
+
+def slot(panel, i, row="hotbar"):
+    """Inventory slot i (0-8) of a row: hotbar, or inv1/inv2/inv3."""
+    gx, gy = G_HOTBAR if row == "hotbar" else (
+        G_INV[0], G_INV[1] + G_PITCH * {"inv1": 0, "inv2": 1, "inv3": 2}[row])
+    return gpoint(panel, gx + G_PITCH * i, gy)
+
+
+def craft2(panel, i):
+    """One of the four 2x2 crafting slots, in reading order."""
+    gx, gy = G_CRAFT2
+    return gpoint(panel, gx + G_PITCH * (i % 2), gy + G_PITCH * (i // 2))
+
+
+def craft3(panel, i):
+    """One of the nine slots on a crafting table, in reading order."""
+    gx, gy = G_CRAFT3
+    return gpoint(panel, gx + G_PITCH * (i % 3), gy + G_PITCH * (i // 3))
+
+
+def craft3_out(panel):
+    return gpoint(panel, *G_CRAFT3_OUT)
+
+
+def craft2_out(panel):
+    return gpoint(panel, *G_CRAFT2_OUT)
+
+
 def see(name, q=80, lift=1.0):
     arr, _ = frame(q)
     if arr is None:

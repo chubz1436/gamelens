@@ -153,6 +153,22 @@ class ObservationRegistry:
             return observation
 
 
+def _button(name: str):
+    """Map a caller's word to a mouse button, refusing anything else.
+
+    A typo must not silently become a left click: the difference between the
+    two buttons in an inventory is the difference between moving a stack and
+    splitting it, and between mining a block and placing one.
+    """
+    from gamelens.input import Button
+
+    try:
+        return {"left": Button.LEFT, "right": Button.RIGHT,
+                "middle": Button.MIDDLE}[str(name).lower()]
+    except KeyError:
+        raise ValueError(f"unknown button {name!r}; use left, right or middle")
+
+
 class GameLens:
     """Owns capture, geometry, safety, input and the arbiter for one target."""
 
@@ -293,12 +309,20 @@ class GameLens:
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
         measure: bool = False, settle: float = CHURN_SETTLE,
+        button: str = "left",
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
         The caller names the observation it was given; the provenance the
         arbiter checks comes from the record made at issue time, never from the
         caller and never re-read from the present.
+
+        ``button`` exists because a left click cannot craft. Minecraft's
+        inventory splits a stack with the right button -- left places all of it,
+        right places one -- so an agent restricted to left clicks can carry
+        items around a grid but cannot put one plank in each of four slots,
+        which is the first recipe in the game. `Arbiter.click_action` already
+        took a button; nothing could reach it.
         """
         observation = self.observations.resolve(observation_id)
         if observation is None:
@@ -308,7 +332,8 @@ class GameLens:
 
         try:
             action = self.arbiter.click_action(
-                observation, x, y, label=label, source=source
+                observation, x, y, label=label, source=source,
+                button=_button(button),
             )
         except ActionRejected as exc:
             # Report the reason the arbiter actually gave. Collapsing every

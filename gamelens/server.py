@@ -135,6 +135,14 @@ class ActionLog:
             ]
 
 
+def _button_name(value) -> str:
+    """The caller's button name, rejected here if it is not one."""
+    from gamelens.app import _button
+
+    _button(value)                 # raises ValueError on anything unknown
+    return str(value).lower()
+
+
 def create_app(runtime) -> FastAPI:
     """Build the app around a GameLens runtime (see gamelens.app)."""
     app = FastAPI(title="GameLens", docs_url=None, redoc_url=None)
@@ -349,6 +357,11 @@ def create_app(runtime) -> FastAPI:
                 call = dict(
                     fn=runtime.submit_click,
                     x=float(body["x"]), y=float(body["y"]),
+                    # Validated here, not just inside submit_click: a bad
+                    # field must fail the request before anything is injected,
+                    # the same way a malformed coordinate does. _button raises
+                    # ValueError, which the handler below turns into a 400.
+                    button=_button_name(body.get("button", "left")),
                 )
             elif kind == "key":
                 call = dict(
