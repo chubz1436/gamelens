@@ -231,6 +231,10 @@ def resume():
             continue
         if in_world(arr):
             return obs
+        if dead_screen(arr):
+            # The death screen's buttons read as a menu, and escape on it asks
+            # "quit to title?". Dying is the caller's decision -- `respawn()`.
+            return None
         if not menu_open(arr):
             # Not the world, and not a screen this knows how to leave. Send
             # nothing: every input to a screen nobody recognised is how View

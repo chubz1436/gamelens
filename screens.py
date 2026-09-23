@@ -91,7 +91,8 @@ def dead_screen(arr):
     for fy in (0.605, 0.700):            # Respawn, Title Screen
         patch = arr[int(h*fy)-4:int(h*fy)+4, int(w*0.50)-18:int(w*0.50)+18].astype(float)
         b, g, r = patch[:,:,0].mean(), patch[:,:,1].mean(), patch[:,:,2].mean()
-        if max(b,g,r) - min(b,g,r) < 30 and 90 < (b+g+r)/3 < 200:
+        # 45, not 90: for its first second the buttons are drawn disabled (~60)
+        if max(b,g,r) - min(b,g,r) < 30 and 45 < (b+g+r)/3 < 200:
             grey += 1
     # the death screen tints everything red; the pause menu does not
     red = arr[:int(h*0.35)].astype(float)

@@ -134,6 +134,15 @@ def test_resume_sends_nothing_to_a_screen_it_does_not_know(bot, monkeypatch):
     assert bot.sent == []
 
 
+def test_resume_does_not_press_escape_on_the_death_screen(bot, monkeypatch):
+    """Live, three times: escape on "You Died!" opened "Are you sure you want to
+    quit?", one click from the title screen. Leaving death to `respawn()`."""
+    assert screens.dead_screen(load("death_quit_risk"))
+    _serve(bot, monkeypatch, ["death_quit_risk"] * 5)
+    assert bot.resume() is None
+    assert bot.sent == []
+
+
 def test_frame_after_uses_the_measured_default(bot, monkeypatch):
     """Inspection GL038-I1: the default must be the measured one, and without a
     default a caller has to say how many frames it assumes."""
