@@ -11,10 +11,23 @@ import json, math, sys, time
 import cv2, numpy as np
 sys.path.insert(0, r"B:\AI_Agent_folder\GAME VIDEO")
 import play
+from screens import (CONTINUE_PLAYING, HOTBAR, RESPAWN, SLOT_CHANGE, at,
+                     dead_screen, demo_dialog, grey_slab, in_world, menu_open,
+                     picked_up, slots)
 
 OP, AG = play.tokens()
 DEG = 1400 / 180.0        # measured against the two pitch stops
-SETTLE = 0.12             # render lag: a frame read sooner shows the old view
+# Render lag, as a guess: a frame read sooner shows the old view. Superseded by
+# frame_after(), which waits for frames the server has actually published since
+# the action; kept only for scripts that have not moved over.
+SETTLE = 0.12
+
+# How many frames past an action's after_frame to wait for. Measured 2026-09-23
+# in the demo (printwindow, 59.5fps), 60 camera turns grouped by the offset
+# actually served: +1 frame showed the turn 0/9 times, +2 7/11, +3..+6 40/40;
+# then 20/20 on fresh trials at +3, a 62ms median wait against SETTLE's 120ms
+# guess. Re-measure if the backend or the game's frame pacing changes.
+AFTER_FRAMES = 3
 
 # barehanded break times, seconds, plus margin
 DIRT, WOOD, STONE_HAND = 1.30, 3.60, 8.00
@@ -120,91 +133,40 @@ def frame(q=50, tries=4):
     return None, None
 
 
-def grey_slab(arr, fx, fy):
-    """True when a flat, unsaturated menu button sits at this fraction of the frame.
+def frame_after(r, frames=None, q=50, wait_ms=500):
+    """The world after an action, not merely the newest frame.
 
-    Fractions, never pixels: every coordinate in this file was read off an
-    856x512 window, and a click at a stored pixel would land somewhere else
-    entirely if the game is ever resized. On the demo dialog the button 25%
-    to the left of the one this aims at is "Purchase Now!", which is reason
-    enough never to click a coordinate that was not verified in the frame
-    being clicked.
+    `r` is an /act result. Its `after_frame` is the frame that was newest when
+    the input was injected; this asks the server for one at least `frames`
+    past it, instead of sleeping a guessed SETTLE and hoping the game drew it.
+
+    Returns (None, None) when there is nothing to wait past -- the action was
+    not sent -- or the frame did not come in time. That is missing evidence and
+    is reported as missing; there is deliberately no sleep-and-grab fallback,
+    which would hand back the very frame this exists to get past.
     """
+    after = (r or {}).get("after_frame")
+    if after is None:
+        return None, None
+    n = AFTER_FRAMES if frames is None else frames
+    if n is None:
+        raise ValueError("frame_after: pass frames= -- no measured default exists yet")
+    FETCHES[_BUCKET] += 1
+    status, data, h = play.req(
+        f"/frame.jpg?quality={q}&after={after}&frames={n}&wait_ms={wait_ms}", AG)
+    if status != 200:
+        return None, None
+    arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if arr is None:
-        return False
-    h, w = arr.shape[:2]
-    patch = arr[int(h*fy)-5:int(h*fy)+5, int(w*fx)-20:int(w*fx)+20].astype(float)
-    if patch.size == 0:
-        return False
-    b, g, r = patch[:,:,0].mean(), patch[:,:,1].mean(), patch[:,:,2].mean()
-    return max(b,g,r) - min(b,g,r) < 14 and 95 < (b+g+r)/3 < 190
-
-
-def at(arr, fx, fy):
-    """That fraction as pixels in this frame."""
-    h, w = arr.shape[:2]
-    return int(w*fx), int(h*fy)
-
-
-# Where the buttons live, as fractions of the frame.
-CONTINUE_PLAYING = (0.625, 0.728)      # the RIGHT-hand button on the demo dialog
-RESPAWN = (0.500, 0.605)
-
-
-def menu_open(arr):
-    """True when the pause screen is up.
-
-    Losing the foreground does not merely pause singleplayer Minecraft, it opens
-    the Game Menu -- and taking the foreground back does not close it. Every
-    action then goes to the menu, the world stays frozen, and the harness
-    reports a clean "sent" for each one. That is the failure this whole session
-    kept rediscovering, so it is worth detecting directly: the menu's buttons
-    are large, flat, unsaturated grey slabs at fixed positions, which the world
-    behind them is not.
-    """
-    if arr is None:
-        return False
-    h, w = arr.shape[:2]
-    spots = [(0.50, 0.36), (0.38, 0.64), (0.62, 0.64)]   # Back to Game, Options, World Options
-    grey = 0
-    for fx, fy in spots:
-        patch = arr[int(h*fy)-4:int(h*fy)+4, int(w*fx)-18:int(w*fx)+18].astype(float)
-        if patch.size == 0:
-            continue
-        b, g, r = patch[:,:,0].mean(), patch[:,:,1].mean(), patch[:,:,2].mean()
-        if max(b,g,r) - min(b,g,r) < 12 and 90 < (b+g+r)/3 < 190:
-            grey += 1
-    return grey == 3
+        return None, None
+    return arr, h.get("x-gamelens-observation")
 
 
 def dead(arr=None):
-    """True when the death screen is up.
-
-    Worth its own check because the harness spent seven swings reporting a
-    calm, identical "nothing happened" while the player was lying dead behind
-    the screen. Minecraft does say what killed you -- the harness simply was not
-    reading it. The two large buttons sit lower than the pause menu's and there
-    is no third.
-
-    Takes the array rather than fetching one: three JPEG round trips to send a
-    single keystroke was most of the per-action cost, and every probe in a given
-    pass should be judging the *same* screen anyway.
-    """
+    """`screens.dead_screen`, fetching a frame when none is given."""
     if arr is None:
         arr, _ = frame(60)
-    if arr is None:
-        return False
-    h, w = arr.shape[:2]
-    grey = 0
-    for fy in (0.605, 0.700):            # Respawn, Title Screen
-        patch = arr[int(h*fy)-4:int(h*fy)+4, int(w*0.50)-18:int(w*0.50)+18].astype(float)
-        b, g, r = patch[:,:,0].mean(), patch[:,:,1].mean(), patch[:,:,2].mean()
-        if max(b,g,r) - min(b,g,r) < 30 and 90 < (b+g+r)/3 < 200:
-            grey += 1
-    # the death screen tints everything red; the pause menu does not
-    red = arr[:int(h*0.35)].astype(float)
-    tinted = red[:,:,2].mean() > red[:,:,1].mean() * 1.25
-    return grey == 2 and tinted
+    return dead_screen(arr)
 
 
 def respawn():
@@ -219,32 +181,6 @@ def respawn():
         time.sleep(2.5)
         arr, _ = frame(60)
     return not dead(arr)
-
-
-def demo_dialog(arr):
-    """True when the demo's own splash is up.
-
-    It reappears every time the pause menu is opened, it freezes the world
-    behind it, and it is not the pause menu -- so the pause-menu detector walks
-    straight past it while every action lands in a dialog. Its two buttons sit
-    lower and further apart than the pause menu's single column.
-
-    The two buttons alone are not enough, and assuming they were cost real
-    damage: Options and Accessibility both carry a grey button pair at the same
-    height, so this returned True on a settings screen, `resume()` "dismissed"
-    it by clicking (544,378) -- which on that screen is a setting -- and the
-    harness walked itself through the menus, toggled View Bobbing off and
-    quit to the title screen, all while reporting recovery. The settings
-    screens are a *grid*: they also have button pairs at 43% and 53% height,
-    where the demo dialog has its dark text panel. Requiring those to be empty
-    separates them cleanly on every screen this session has seen.
-    """
-    if arr is None:
-        return False
-    buttons = sum(grey_slab(arr, fx, 0.728) for fx in (0.372, 0.625))
-    grid = any(grey_slab(arr, fx, fy)
-               for fy in (0.43, 0.53) for fx in (0.372, 0.625))
-    return buttons == 2 and not grid
 
 
 def dismiss_demo_dialog():
@@ -293,8 +229,14 @@ def resume():
         if demo_dialog(arr):
             dismiss_demo_dialog()
             continue
-        if not menu_open(arr):
+        if in_world(arr):
             return obs
+        if not menu_open(arr):
+            # Not the world, and not a screen this knows how to leave. Send
+            # nothing: every input to a screen nobody recognised is how View
+            # Bobbing got switched off and the game quit to the title while
+            # this reported recovery.
+            return None
         # the observation from the top of this pass is seconds old at most and
         # describes the very menu being closed; fetching another would be the
         # third round trip this change exists to remove.
@@ -307,7 +249,7 @@ def resume():
     # gameplay input into a dialog and is told it was sent.
     with counting("recovery"):
         arr, obs = frame(35)
-    if arr is None or menu_open(arr) or demo_dialog(arr):
+    if not in_world(arr):
         return None
     return obs
 
@@ -517,55 +459,6 @@ def grid(tiles, name, scale=0.62):
     rows = [np.hstack(tiles[i:i + 2]) for i in range(0, len(tiles), 2)]
     cv2.imwrite(str(play.SHOTS / name),
                 cv2.resize(np.vstack(rows), None, fx=scale, fy=scale))
-
-
-# The nine hotbar slots, as fractions of the frame: x0, y0, x1, y1. Measured off
-# a real 870x519 capture rather than assumed, and kept as fractions so a resized
-# window does not silently move them.
-HOTBAR = (0.2885, 0.898, 0.7057, 0.979)
-SLOT_CHANGE = 6.0
-
-
-def slots(arr):
-    """Mean colour of each hotbar slot -- the closest thing to an inventory read.
-
-    Not a parser: it cannot say *what* is in a slot, only that a slot looks
-    different than it did. That is enough to answer the question the drivers
-    were answering with churn, and it answers it about the inventory instead of
-    about the whole screen.
-    """
-    if arr is None:
-        return None
-    h, w = arr.shape[:2]
-    fx0, fy0, fx1, fy1 = HOTBAR
-    x0, x1 = int(w * fx0), int(w * fx1)
-    y0, y1 = int(h * fy0), int(h * fy1)
-    strip = arr[y0:y1, x0:x1].astype(np.float32)
-    if strip.size == 0:
-        return None
-    step = strip.shape[1] / 9.0
-    out = []
-    for i in range(9):
-        inner = strip[:, int(i * step) + 4:int((i + 1) * step) - 4]
-        out.append(inner.mean(axis=(0, 1)) if inner.size else np.zeros(3, np.float32))
-    return np.array(out)
-
-
-def picked_up(before, after, floor=SLOT_CHANGE):
-    """True when one slot changed and the others did not.
-
-    The slots are semi-transparent, so the world showing through them drifts
-    every time the player moves or the light changes -- and that drift moves all
-    nine together. An item arriving moves one. Subtracting the median slot's
-    change from the largest one leaves the part that is about the inventory,
-    which is why this is not simply a threshold on the difference.
-
-    Returns None when either reading is missing: no evidence, not "no".
-    """
-    if before is None or after is None:
-        return None
-    deltas = np.abs(after - before).mean(axis=1)
-    return float(deltas.max() - np.median(deltas)) > floor
 
 
 def inventory():

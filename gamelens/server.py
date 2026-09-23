@@ -29,6 +29,47 @@ _STATIC = Path(__file__).parent / "static"
 
 MJPEG_BOUNDARY = "gamelens-frame"
 
+# At most this many `/frame.jpg?after=` requests may be waiting at once; the
+# next is told 429 before it waits at all. The wait itself runs on the event
+# loop and holds no worker thread, so this is not what protects /stop -- it
+# bounds how many pollers the loop carries for callers that ask for a frame
+# that is never coming.
+MAX_FRAME_WAITS = 4
+
+# How often a waiting `/frame.jpg?after=` looks at the newest frame id. Well
+# under one frame interval at the rates seen (50-90fps), and each look is a
+# lock-guarded integer read.
+FRAME_POLL = 0.004
+
+
+class Encoded:
+    """One encoded frame and the ids that name it."""
+
+    __slots__ = ("jpeg", "observation_id", "frame_id")
+
+    def __init__(self, jpeg: bytes, observation_id: str, frame_id: int) -> None:
+        self.jpeg = jpeg
+        self.observation_id = observation_id
+        self.frame_id = frame_id
+
+
+class _Outcome:
+    """A named non-frame result, so `is NO_FRAME` reads as what it means."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+# Nothing new enough in the slot -- empty, older than asked for, or cleared by
+# a failover. Worth waiting through.
+NO_FRAME = _Outcome("NO_FRAME")
+# A frame was leased and could not be encoded. Waiting would re-encode the same
+# frame and fail the same way.
+ENCODE_FAILED = _Outcome("ENCODE_FAILED")
+
 
 class Tokens:
     """Two capabilities. The agent's credential can never arm the system."""
@@ -222,17 +263,75 @@ def create_app(runtime) -> FastAPI:
         from gamelens.windows import list_windows
         return JSONResponse([w.to_dict() for w in list_windows()])
 
+    waiting = {"frames": 0}          # in-flight `after=` waits; loop-only, no lock
+
     @app.get("/frame.jpg")
-    def frame_jpg(quality: int = 70, role: str = Depends(any_role)) -> Response:
-        jpeg, observation_id = runtime.encode_latest(quality=quality)
-        if jpeg is None:
-            raise HTTPException(503, "no frame available yet")
-        # The caller needs this to act on what it just looked at. Without it the
-        # only way to name a frame is to guess an id from /state, which will
-        # already be several frames out of date at 120fps.
+    async def frame_jpg(
+        quality: int = 70,
+        after: int | None = Query(default=None, ge=0),
+        frames: int = Query(default=1, ge=1, le=30),
+        wait_ms: int = Query(default=500, ge=0, le=2000),
+        role: str = Depends(any_role),
+    ) -> Response:
+        """The newest frame -- or, with ``after``, the newest frame at least
+        ``frames`` past the id an /act returned as ``after_frame``.
+
+        An action is acknowledged when injected, not when drawn, so the frame
+        that is newest the moment /act answers can still show the world before
+        it. ``after`` replaces the guessed sleep a caller would otherwise need.
+
+        `async` on purpose, unlike the other read paths. The wait can last
+        seconds, and a sync endpoint would spend all of it holding a worker
+        from the pool that /stop is served from. So the wait polls on the loop,
+        which holds nothing, and only the encode goes to a thread.
+        """
+        if after is None:
+            result = await asyncio.to_thread(runtime.encode_frame, quality)
+            if result is ENCODE_FAILED:
+                raise HTTPException(503, "frame encode failed")
+            if not isinstance(result, Encoded):
+                raise HTTPException(503, "no frame available yet")
+            return _frame_response(result)
+
+        if waiting["frames"] >= MAX_FRAME_WAITS:
+            raise HTTPException(429, "too many frame waits in flight")
+        waiting["frames"] += 1
+        try:
+            target = after + frames
+            deadline = time.monotonic() + wait_ms / 1000.0
+            while True:
+                if runtime.latest_frame_id() >= target:
+                    result = await asyncio.to_thread(
+                        runtime.encode_frame, quality, min_frame_id=target
+                    )
+                    if isinstance(result, Encoded):
+                        return _frame_response(result)
+                    if result is ENCODE_FAILED:
+                        raise HTTPException(503, "frame encode failed")
+                    # NO_FRAME: the qualifying frame went between the look and
+                    # the lease -- a failover cleared the slot. The deadline has
+                    # not moved, so keep waiting for its replacement.
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(FRAME_POLL)
+        finally:
+            waiting["frames"] -= 1
+        # Never the stale frame: getting past it is what the caller asked for.
+        raise HTTPException(
+            504, f"no frame with id >= {target} within {wait_ms}ms",
+            headers={"X-GameLens-Latest-Frame": str(runtime.latest_frame_id())},
+        )
+
+    def _frame_response(result: Encoded) -> Response:
+        # The observation id is what a caller acts on; without it the only way
+        # to name a frame is to guess an id from /state, already several frames
+        # stale at 120fps. The frame id is what it waits past next time.
         return Response(
-            jpeg, media_type="image/jpeg",
-            headers={"X-GameLens-Observation": observation_id},
+            result.jpeg, media_type="image/jpeg",
+            headers={
+                "X-GameLens-Observation": result.observation_id,
+                "X-GameLens-Frame": str(result.frame_id),
+            },
         )
 
     @app.get("/stream.mjpg")
@@ -240,24 +339,25 @@ def create_app(runtime) -> FastAPI:
         interval = 1.0 / max(1, min(fps, 60))
 
         async def frames():
-            last_id = ""
+            last_frame = 0
             while True:
                 # Off the loop: this acquires a pool buffer and JPEG-encodes it.
                 # A 3441x1440 frame is tens of milliseconds, every frame, and
                 # the stream is the one endpoint that runs continuously.
-                jpeg, observation_id = await asyncio.to_thread(
-                    runtime.encode_latest, quality
-                )
-                if jpeg is not None and observation_id != last_id:
-                    last_id = observation_id
+                result = await asyncio.to_thread(runtime.encode_frame, quality)
+                if isinstance(result, Encoded) and result.frame_id != last_frame:
+                    last_frame = result.frame_id
                     # Each part names the observation it is, so a consumer
-                    # reading the stream can act on the exact image it saw.
+                    # reading the stream can act on the exact image it saw, and
+                    # the frame it came from -- taken off the encoded frame, not
+                    # the slot, which may already hold a newer one.
                     yield (
                         b"--" + MJPEG_BOUNDARY.encode() + b"\r\n"
                         b"Content-Type: image/jpeg\r\n"
-                        b"X-GameLens-Observation: " + observation_id.encode() + b"\r\n"
-                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                        + jpeg + b"\r\n"
+                        b"X-GameLens-Observation: " + result.observation_id.encode() + b"\r\n"
+                        b"X-GameLens-Frame: " + str(result.frame_id).encode() + b"\r\n"
+                        b"Content-Length: " + str(len(result.jpeg)).encode() + b"\r\n\r\n"
+                        + result.jpeg + b"\r\n"
                     )
                 await asyncio.sleep(interval)
 

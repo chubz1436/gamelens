@@ -18,7 +18,9 @@ from gamelens.capture import Backend, CaptureSupervisor
 from gamelens.coords import GeometryTracker
 from gamelens.input import InputExecutor
 from gamelens.safety import SafetySupervisor
-from gamelens.server import ActionLog, Tokens, encode_jpeg
+from gamelens.server import (
+    ENCODE_FAILED, NO_FRAME, ActionLog, Encoded, Tokens, encode_jpeg,
+)
 from gamelens.windows import WindowInfo, describe, find_window
 
 log = logging.getLogger(__name__)
@@ -84,6 +86,12 @@ class Dispatch:
     detail: str = ""
     action_id: int | None = None
     churn: float | None = None
+    # The newest frame id at the instant the executor finished injecting, or
+    # None when nothing was injected. Any frame with a larger id was captured
+    # after the input existed; `/frame.jpg?after=` waits for one. It is NOT a
+    # promise the game has drawn the result yet -- games render a frame or
+    # more behind their input, which is what `frames=` is for.
+    after_frame: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -108,6 +116,7 @@ class Dispatch:
             "detail": self.detail,
             "action_id": self.action_id,
             "churn": self.churn,
+            "after_frame": self.after_frame,
         }
 
 
@@ -282,26 +291,48 @@ class GameLens:
         finally:
             frame.release()
 
-    def encode_latest(self, quality: int = 70) -> tuple[bytes | None, str]:
-        """Encode the newest frame and register what was handed out.
+    def latest_frame_id(self) -> int:
+        """Id of the newest published frame, 0 before the first. Cheap and
+        non-blocking, so the HTTP layer can poll it from the event loop."""
+        return self.capture.frames.latest_id()
 
-        Returns ``(jpeg, observation_id)``. The record captures the transport
-        scale, so a coordinate in the delivered image can be mapped back to the
-        native frame -- without it, a 1920-wide frame served at 1280 would put
-        every click two thirds of the way to where it belonged.
+    def encode_frame(self, quality: int = 70, *, min_frame_id: int | None = None):
+        """Encode the newest frame and register what was handed out. Never blocks.
+
+        Returns ``Encoded`` -- whose ``frame_id`` is read off the very frame
+        that was encoded, not re-read from the slot, which may already hold a
+        newer one -- or ``NO_FRAME`` when the slot is empty or holds nothing
+        new enough (a failover ``clear()`` lands here too), or
+        ``ENCODE_FAILED`` when a frame was leased and could not be encoded.
+        The caller needs those two apart: the first is worth waiting through,
+        the second would only fail the same way again.
+
+        The record captures the transport scale, so a coordinate in the
+        delivered image can be mapped back to the native frame -- without it, a
+        1920-wide frame served at 1280 would put every click two thirds of the
+        way to where it belonged.
         """
-        frame = self.capture.frames.acquire()
+        frame = self.capture.frames.acquire(timeout=0)
         if frame is None:
-            return None, ""
+            return NO_FRAME
         try:
+            if min_frame_id is not None and frame.frame_id < min_frame_id:
+                return NO_FRAME
             jpeg, scale = encode_jpeg(frame.array, quality=quality)
             observation = self.arbiter.observation_for(frame, scale=scale)
-            return jpeg, self.observations.issue(observation)
+            return Encoded(jpeg, self.observations.issue(observation), frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
-            return None, ""
+            return ENCODE_FAILED
         finally:
             frame.release()
+
+    def encode_latest(self, quality: int = 70) -> tuple[bytes | None, str]:
+        """``encode_frame`` for callers that only want ``(jpeg, observation_id)``."""
+        result = self.encode_frame(quality)
+        if isinstance(result, Encoded):
+            return result.jpeg, result.observation_id
+        return None, ""
 
     # --- actions ----------------------------------------------------------
 
@@ -488,8 +519,15 @@ class GameLens:
 
         settled = threading.Event()
         box: list = []
+        marks: list = []
 
         def on_outcome(outcome) -> None:
+            # Read before anything else on this path: the point is the frame
+            # that was newest when injection ended, not a moment later.
+            try:
+                marks.append(self.capture.frames.latest_id())
+            except Exception:
+                log.debug("after_frame read failed", exc_info=True)
             box.append(outcome)
             self.log.resolve(entry_id, outcome.status, outcome.detail)
             settled.set()
@@ -508,12 +546,17 @@ class GameLens:
             # working perfectly -- the honest answer to the wrong question.
             settled.wait(wait + _expected_duration(action))
         outcome = box[0] if box else None
+        # 0 means nothing had been published yet: there is no frame to wait
+        # past, and reporting 0 would make "any frame at all" look like "after".
+        injected = (outcome is not None and outcome.status == "sent"
+                    and bool(marks) and marks[0] > 0)
         return Dispatch(
             "ok",
             outcome.status if outcome else "pending",
             outcome.detail if outcome else "",
             action.action_id,
             churn=self._churn_since(before, outcome, settle),
+            after_frame=marks[0] if injected else None,
         )
 
     def _churn_since(self, before, outcome, settle: float) -> float | None:

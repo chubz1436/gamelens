@@ -265,6 +265,30 @@ class LatestFrame:
                 self._arrived.wait(timeout)
             return self._frame.retain() if self._frame else None
 
+    def latest_id(self) -> int:
+        """The id of the newest published frame, or 0 before the first one."""
+        with self._lock:
+            return self._frame.frame_id if self._frame else 0
+
+    def acquire_at_least(self, min_id: int, timeout: float) -> Frame | None:
+        """Lease the newest frame once its id reaches ``min_id``, or None.
+
+        This is how a caller sees the world *after* an action rather than
+        whatever happened to be newest: an action returns the id that was
+        current when its injection finished, and a frame published later than
+        that was at least captured after the input existed. None means the
+        deadline passed first -- the caller is told so, never handed the stale
+        picture it was trying to get past.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            while self._frame is None or self._frame.frame_id < min_id:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._arrived.wait(remaining)
+            return self._frame.retain()
+
     def clear(self) -> None:
         with self._lock:
             old, self._frame = self._frame, None

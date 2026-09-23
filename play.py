@@ -9,7 +9,6 @@ import json, pathlib, sys, time, urllib.error, urllib.request
 import win32con, win32gui
 
 BASE = "http://127.0.0.1:8777"
-HWND = 5442666
 TMP = pathlib.Path(r"C:\Users\CHUBZS~1\AppData\Local\Temp")
 SHOTS = pathlib.Path(r"C:\Users\CHUBZS~1\AppData\Local\Temp\claude\B--AI-Agent-folder-GAME-VIDEO\20d12316-c40d-48f3-ae5e-bc7d2232e694\scratchpad")
 
@@ -28,6 +27,33 @@ def req(path, token, method="GET", body=None):
             return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as e:
         return e.code, e.read(), dict(e.headers)
+
+
+def target_hwnd():
+    """The window the running server captures, asked of the server itself.
+
+    This was a constant, and a window handle lives only as long as its window:
+    every restart of the game left focus-taking aimed at a handle that no
+    longer existed, so the game paused on the first focus loss and stayed
+    paused. 0 when the server is not up -- no window, so no focus is taken.
+    """
+    try:
+        status, body, _ = req("/state", tokens()[1])
+        if status != 200:
+            return 0
+        state = json.loads(body)
+    except (OSError, ValueError):
+        return 0
+    # Runs at import: a malformed answer must mean "no window", never an
+    # import error that takes every driver down with it.
+    target = state.get("target") if isinstance(state, dict) else None
+    hwnd = target.get("hwnd") if isinstance(target, dict) else None
+    if isinstance(hwnd, bool) or not isinstance(hwnd, int) or not 0 < hwnd < 2**64:
+        return 0
+    return hwnd
+
+
+HWND = target_hwnd()
 
 
 def focus():

@@ -18,9 +18,9 @@ time.sleep(0.3)
 
 for i in range(steps):
     a, _ = bot.frame(40)
-    bot.act(kind="key", key="w", hold=0.45, label="approach")
-    time.sleep(bot.SETTLE)
-    b, _ = bot.frame(40)
+    r = bot.act(kind="key", key="w", hold=0.45, label="approach")
+    # The frame drawn after the step, not whatever was newest when it returned.
+    b, _ = bot.frame_after(r, q=40)
     if a is None or b is None:
         print(f"  step {i}: no frame")
         continue
