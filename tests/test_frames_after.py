@@ -299,7 +299,7 @@ def test_a_stream_part_names_the_frame_that_was_encoded(frt):
 
 
 class _Registry:
-    def issue(self, observation) -> str:
+    def issue(self, observation, *, jpeg=None, quality=None) -> str:
         return "obs"
 
 

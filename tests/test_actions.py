@@ -57,16 +57,31 @@ def test_named_keys_resolve():
     assert key_code(" Shift ") == 0xA0
 
 
-@pytest.mark.parametrize("name", ["f4", "lwin", "delete", "f12", "menu", ""])
+@pytest.mark.parametrize("name", ["lwin", "rwin", "win", "menu", "apps", "f12", "pause",
+                                  "printscreen", "capslock", "numlock", "scrolllock",
+                                  "f13", "ctrl+w", ""])
 def test_keys_outside_the_allowlist_are_refused(name):
     """An allowlist, not a lookup with a fallback.
 
-    A caller that can name any virtual key can send Alt+F4 to the game, or the
-    Windows key to the desktop behind it. Neither is input to a game, and
-    neither is something an agent should be able to reach by naming it.
+    The Windows and menu keys belong to the shell, F12 and Pause are GameLens's
+    own kill switch, and the lock keys outlive the session in the Owner's
+    keyboard state. None is input to a game, and none is something an agent
+    should be able to reach by naming it.
     """
     with pytest.raises(ValueError):
         key_code(name)
+
+
+@pytest.mark.parametrize("name,vk", [("f4", 0x73), ("f11", 0x7A), ("delete", 0x2E),
+                                     ("tab", 0x09), ("numpad7", 0x67), ("backtick", 0xC0),
+                                     ("`", 0xC0), ("/", 0xBF), ("pagedown", 0x22),
+                                     ("rctrl", 0xA3), ("backspace", 0x08)])
+def test_any_games_keys_are_named(name, vk):
+    """GL-040: the table is every key a game binds by default, not Minecraft's
+    handful. F4 and Delete were once refused for fear of Alt+F4 and
+    Ctrl+Alt+Del; neither chord is reachable -- a single key action holds one
+    key, and a sequence cannot press alt (see test_sequence)."""
+    assert key_code(name) == vk
 
 
 # --- clamps ----------------------------------------------------------------

@@ -54,6 +54,18 @@ CHURN_SETTLE = 0.15
 # to park a worker thread for a minute.
 MAX_SETTLE = 1.0
 
+# Rebinding a click to a newer frame (GL039-R3). The click point's own
+# neighbourhood must be unchanged, compared in colour at the resolution the
+# agent was shown; the whole-image score is a second, coarser check and never
+# the authorisation for the target itself. 33x33 transport pixels is about 40
+# frame pixels at 1557 wide -- larger than an inventory slot, so an item that
+# arrived, left or changed in the clicked slot fails it. JPEG encoding is
+# deterministic for identical pixels, so these only absorb re-render jitter.
+PATCH_HALF = 16                # 33x33
+PATCH_MAX_DIFF = 12            # per pixel, per channel, 0-255
+PATCH_MEAN_DIFF = 1.0
+GLOBAL_MAD = 2.0
+
 
 def _expected_duration(action) -> float:
     """How long the action's own dwells will take, at minimum.
@@ -92,6 +104,10 @@ class Dispatch:
     # promise the game has drawn the result yet -- games render a frame or
     # more behind their input, which is what `frames=` is for.
     after_frame: int | None = None
+    # How the action was bound when the caller asked for rebinding: which
+    # observation it ran on, and for a click the patch scores that allowed it
+    # or refused it. None when rebinding was not asked for.
+    binding: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -117,6 +133,7 @@ class Dispatch:
             "action_id": self.action_id,
             "churn": self.churn,
             "after_frame": self.after_frame,
+            **(self.binding or {}),
         }
 
 
@@ -137,29 +154,70 @@ class ObservationRegistry:
         self._ttl = ttl
         self._lock = threading.Lock()
 
-    def issue(self, observation) -> str:
+    def issue(self, observation, *, jpeg: bytes | None = None,
+              quality: int | None = None) -> str:
+        """Record what was handed out. ``jpeg`` and ``quality`` are the exact
+        image the caller received, kept so a later rebind can compare the
+        pixels the decision was made on (GL039-R3); they live and die with the
+        record, so memory is bounded by the capacity."""
         token = secrets.token_urlsafe(9)
         now = time.monotonic()
         with self._lock:
-            self._records[token] = (observation, now)
+            self._records[token] = (observation, now, jpeg, quality)
             while len(self._records) > self._capacity:
                 self._records.popitem(last=False)
             # Opportunistic expiry; bounded work per issue.
-            for key in [k for k, (_, t) in list(self._records.items())[:8]
+            for key in [k for k, (_, t, *_rest) in list(self._records.items())[:8]
                         if now - t > self._ttl]:
                 self._records.pop(key, None)
         return token
 
     def resolve(self, token: str):
+        record = self.record(token)
+        return record[0] if record else None
+
+    def record(self, token: str):
+        """``(observation, jpeg, quality)`` for a live record, else None."""
         with self._lock:
             entry = self._records.get(token)
             if entry is None:
                 return None
-            observation, issued_at = entry
+            observation, issued_at, jpeg, quality = entry
             if time.monotonic() - issued_at > self._ttl:
                 self._records.pop(token, None)
                 return None
-            return observation
+            return observation, jpeg, quality
+
+
+def same_at_click(shown_jpeg: bytes, fresh_jpeg: bytes, x: float, y: float) -> dict:
+    """Is the screen at ``(x, y)`` still what the agent was shown?
+
+    Both images are at the transport resolution the agent saw, and ``x, y`` is
+    in those pixels. Returns the scores and ``ok``; never raises for bad input,
+    it answers no.
+    """
+    out = {"patch_max": None, "patch_mean": None, "global_mad": None, "ok": False}
+    try:
+        a = cv2.imdecode(np.frombuffer(shown_jpeg, np.uint8), cv2.IMREAD_COLOR)
+        b = cv2.imdecode(np.frombuffer(fresh_jpeg, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        return out
+    if a is None or b is None or a.shape != b.shape:
+        return out
+    h, w = a.shape[:2]
+    cx, cy = int(round(x)), int(round(y))
+    if not (0 <= cx < w and 0 <= cy < h):
+        return out
+    diff = np.abs(a.astype(np.int16) - b.astype(np.int16))
+    patch = diff[max(0, cy - PATCH_HALF):cy + PATCH_HALF + 1,
+                 max(0, cx - PATCH_HALF):cx + PATCH_HALF + 1]
+    out["patch_max"] = int(patch.max())
+    out["patch_mean"] = round(float(patch.mean()), 3)
+    out["global_mad"] = round(float(diff.mean()), 3)
+    out["ok"] = (out["patch_max"] <= PATCH_MAX_DIFF
+                 and out["patch_mean"] <= PATCH_MEAN_DIFF
+                 and out["global_mad"] <= GLOBAL_MAD)
+    return out
 
 
 def _button(name: str):
@@ -169,13 +227,9 @@ def _button(name: str):
     two buttons in an inventory is the difference between moving a stack and
     splitting it, and between mining a block and placing one.
     """
-    from gamelens.input import Button
+    from gamelens.input import button_from_name
 
-    try:
-        return {"left": Button.LEFT, "right": Button.RIGHT,
-                "middle": Button.MIDDLE}[str(name).lower()]
-    except KeyError:
-        raise ValueError(f"unknown button {name!r}; use left, right or middle")
+    return button_from_name(name)
 
 
 class GameLens:
@@ -320,7 +374,8 @@ class GameLens:
                 return NO_FRAME
             jpeg, scale = encode_jpeg(frame.array, quality=quality)
             observation = self.arbiter.observation_for(frame, scale=scale)
-            return Encoded(jpeg, self.observations.issue(observation), frame.frame_id)
+            token = self.observations.issue(observation, jpeg=jpeg, quality=quality)
+            return Encoded(jpeg, token, frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
             return ENCODE_FAILED
@@ -340,7 +395,7 @@ class GameLens:
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
         measure: bool = False, settle: float = CHURN_SETTLE,
-        button: str = "left",
+        button: str = "left", rebind: bool = False,
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
@@ -355,11 +410,10 @@ class GameLens:
         which is the first recipe in the game. `Arbiter.click_action` already
         took a button; nothing could reach it.
         """
-        observation = self.observations.resolve(observation_id)
-        if observation is None:
-            detail = f"observation {observation_id[:8]}... is unknown or expired"
-            self.log.add(f"{label}: {detail}", "denied")
-            return Dispatch(Rejection.STALE_OBSERVATION.name, "denied", detail)
+        bound = self._bind(observation_id, label, rebind, points=[(x, y)])
+        if isinstance(bound, Dispatch):
+            return bound
+        observation, binding = bound
 
         try:
             action = self.arbiter.click_action(
@@ -373,13 +427,14 @@ class GameLens:
             # looking in the wrong place.
             entry = self.log.add(f"{label}: {exc}", "denied")
             self.log.mark(x, y, "denied", label, entry_id=entry)
-            return Dispatch(exc.reason.name, "denied", str(exc))
+            return Dispatch(exc.reason.name, "denied", str(exc), binding=binding)
         except Exception as exc:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("submit_click failed for %r", label)
-            return Dispatch("ERROR", "error", str(exc))
+            return Dispatch("ERROR", "error", str(exc), binding=binding)
 
-        return self._dispatch(action, x, y, label, wait=wait, measure=measure, settle=settle)
+        return self._dispatch(action, x, y, label, wait=wait, measure=measure,
+                              settle=settle, binding=binding)
 
     def submit_observation_click(
         self, observation, x: float, y: float, *, label: str = "",
@@ -417,11 +472,11 @@ class GameLens:
     def submit_key(
         self, *, observation_id: str, key: str, hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False, settle: float = CHURN_SETTLE,
+        measure: bool = False, settle: float = CHURN_SETTLE, rebind: bool = False,
     ) -> Dispatch:
         """Press one key in the image's world. See Arbiter.key_action."""
         return self._submit_named(
-            observation_id, label or f"key {key}", source, wait, measure, settle,
+            observation_id, label or f"key {key}", source, wait, measure, settle, rebind,
             lambda obs: self.arbiter.key_action(
                 obs, key, hold=hold, label=label or "key", source=source
             ),
@@ -430,11 +485,11 @@ class GameLens:
     def submit_press(
         self, *, observation_id: str, button: str = "left", hold: float = 0.08,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False, settle: float = CHURN_SETTLE,
+        measure: bool = False, settle: float = CHURN_SETTLE, rebind: bool = False,
     ) -> Dispatch:
         """Hold a mouse button without moving. See Arbiter.press_action."""
         return self._submit_named(
-            observation_id, label or f"press {button}", source, wait, measure, settle,
+            observation_id, label or f"press {button}", source, wait, measure, settle, rebind,
             lambda obs: self.arbiter.press_action(
                 obs, button=button, hold=hold, label=label or "press", source=source
             ),
@@ -443,17 +498,127 @@ class GameLens:
     def submit_look(
         self, *, observation_id: str, dx: float, dy: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
-        measure: bool = False, settle: float = CHURN_SETTLE,
+        measure: bool = False, settle: float = CHURN_SETTLE, rebind: bool = False,
     ) -> Dispatch:
         """Turn the camera. See Arbiter.look_action."""
         return self._submit_named(
             observation_id, label or f"look {dx:+.0f},{dy:+.0f}", source, wait, measure, settle,
+            rebind,
             lambda obs: self.arbiter.look_action(
                 obs, dx, dy, label=label or "look", source=source
             ),
         )
 
-    def _submit_named(self, observation_id, label, source, wait, measure, settle, build) -> Dispatch:
+    def submit_sequence(
+        self, *, observation_id: str, steps: list,
+        label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False, settle: float = CHURN_SETTLE, rebind: bool = False,
+    ) -> Dispatch:
+        """Several overlapping primitives as one decision. ``steps`` must already
+        have been through ``arbiter.parse_sequence``; see Arbiter.sequence_action.
+
+        Every point the sequence moves the pointer to is a click point for
+        rebinding: each must still look as it was shown."""
+        from gamelens.arbiter import sequence_points
+
+        return self._submit_named(
+            observation_id, label or "sequence", source, wait, measure, settle, rebind,
+            lambda obs: self.arbiter.sequence_action(
+                obs, steps, label=label or "sequence", source=source
+            ),
+            points=sequence_points(steps),
+        )
+
+    def submit_scroll(
+        self, *, observation_id: str, clicks: float, horizontal: bool = False,
+        label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
+        measure: bool = False, settle: float = CHURN_SETTLE, rebind: bool = False,
+    ) -> Dispatch:
+        """Turn the mouse wheel. See Arbiter.scroll_action."""
+        return self._submit_named(
+            observation_id, label or "scroll", source, wait, measure, settle, rebind,
+            lambda obs: self.arbiter.scroll_action(
+                obs, clicks, horizontal=horizontal, label=label or "scroll", source=source
+            ),
+        )
+
+    def sequence_capacity(self) -> float:
+        """How many new inputs one sequence may contain: the rate bucket's size."""
+        return self.safety.rate_capacity
+
+    def _bind(self, observation_id: str, label: str, rebind: bool, *, points=()):
+        """The observation an action runs on, and how it was chosen.
+
+        Returns ``(observation, binding)`` or a denial ``Dispatch``.
+
+        Without ``rebind`` this is the record the caller names, as it always
+        was. With it, an observation that has aged past the arbiter's limits is
+        carried over to the newest frame -- the only way an agent whose own turn
+        outlasts ACTION_TTL can act at all -- but only when age is all that
+        changed (GL039-R2): target, capture session, geometry, size and the
+        preemption counter are compared between the two records, not merely
+        against the present. For a click -- and for every point a sequence
+        moves to -- the pixels there must also still be what the caller was
+        shown (GL039-R3); the worst point is what gets reported. A record that is
+        gone fails closed: there is nothing left to compare against.
+        """
+        record = self.observations.record(observation_id)
+        if record is None:
+            detail = f"observation {observation_id[:8]}... is unknown or expired"
+            self.log.add(f"{label}: {detail}", "denied")
+            return Dispatch(Rejection.STALE_OBSERVATION.name, "denied", detail)
+        shown, shown_jpeg, quality = record
+        if not rebind:
+            return shown, None
+        if self.arbiter.is_fresh(shown):
+            return shown, {"bound_to": "shown"}
+
+        binding: dict = {"bound_to": None, "shown_frame": shown.frame_id}
+        verdict, detail = Rejection.OK, ""
+        frame = self.capture.frames.acquire(timeout=0)
+        if frame is None:
+            verdict = Rejection.NO_FRAME
+        else:
+            try:
+                fresh = self.arbiter.observation_for(
+                    frame, scale=shown.scale, crop=(shown.crop_left, shown.crop_top))
+                binding["frame"] = fresh.frame_id
+                verdict = self.arbiter.rebind_rejection(shown, fresh)
+                if verdict is Rejection.OK and points:
+                    if shown_jpeg is None:
+                        verdict = Rejection.STALE_OBSERVATION
+                        detail = "no image on record to compare the click point against"
+                    else:
+                        fresh_jpeg, scale = encode_jpeg(frame.array, quality=quality or 70)
+                        checks = [same_at_click(shown_jpeg, fresh_jpeg, *p) for p in points]
+                        # The worst point speaks for all of them. A point that
+                        # could not be compared at all (None scores) is worst.
+                        same = next((c for c in checks if c["patch_max"] is None), None)                             or max(checks, key=lambda c: (c["patch_max"], c["patch_mean"]))
+                        same = dict(same, ok=all(c["ok"] for c in checks))
+                        binding.update({k: v for k, v in same.items() if k != "ok"})
+                        if len(points) > 1:
+                            binding["points"] = len(points)
+                        if scale != shown.scale:
+                            verdict = Rejection.GEOMETRY_MOVED
+                        elif not same["ok"]:
+                            detail = ("the screen at the click point changed since it was "
+                                      "shown; look again")
+                            self.log.add(f"{label}: {detail}", "denied")
+                            return Dispatch("SCREEN_CHANGED", "denied", detail, binding=binding)
+            except Exception as exc:
+                log.exception("rebind failed for %r", label)
+                return Dispatch("ERROR", "error", str(exc), binding=binding)
+            finally:
+                frame.release()
+        if verdict is not Rejection.OK:
+            detail = detail or f"{verdict.value}; look again"
+            self.log.add(f"{label}: not rebound: {detail}", "denied")
+            return Dispatch(verdict.name, "denied", detail, binding=binding)
+        binding["bound_to"] = "fresh"
+        return fresh, binding
+
+    def _submit_named(self, observation_id, label, source, wait, measure, settle, rebind,
+                      build, *, points=()) -> Dispatch:
         """Shared path for actions that have no coordinate to draw or check.
 
         A keystroke and a camera turn carry the same provenance rules as a
@@ -461,30 +626,30 @@ class GameLens:
         but there is nothing to put on the overlay, so they get a log entry and
         no mark.
         """
-        observation = self.observations.resolve(observation_id)
-        if observation is None:
-            detail = f"observation {observation_id[:8]}... is unknown or expired"
-            self.log.add(f"{label}: {detail}", "denied")
-            return Dispatch(Rejection.STALE_OBSERVATION.name, "denied", detail)
+        bound = self._bind(observation_id, label, rebind, points=points)
+        if isinstance(bound, Dispatch):
+            return bound
+        observation, binding = bound
         try:
             action = build(observation)
         except ActionRejected as exc:
             self.log.add(f"{label}: {exc}", "denied")
-            return Dispatch(exc.reason.name, "denied", str(exc))
+            return Dispatch(exc.reason.name, "denied", str(exc), binding=binding)
         except ValueError as exc:
             # An unknown key name. A caller error, not a world that moved.
             self.log.add(f"{label}: {exc}", "denied")
-            return Dispatch("BAD_REQUEST", "denied", str(exc))
+            return Dispatch("BAD_REQUEST", "denied", str(exc), binding=binding)
         except Exception as exc:
             self.log.add(f"{label}: unexpected failure: {exc}", "error")
             log.exception("%s failed", label)
-            return Dispatch("ERROR", "error", str(exc))
-        return self._dispatch(action, None, None, label, wait=wait, measure=measure, settle=settle)
+            return Dispatch("ERROR", "error", str(exc), binding=binding)
+        return self._dispatch(action, None, None, label, wait=wait, measure=measure,
+                              settle=settle, binding=binding)
 
     def _dispatch(
         self, action, x: float | None, y: float | None, label: str,
         *, wait: float = 0.0, measure: bool = False,
-        settle: float = CHURN_SETTLE,
+        settle: float = CHURN_SETTLE, binding: dict | None = None,
     ) -> Dispatch:
         """Submit an action and, optionally, wait to find out what became of it.
 
@@ -537,7 +702,8 @@ class GameLens:
             # Never queued, so no outcome is coming; resolve it here or the
             # entry sits at "queued" forever.
             self.log.resolve(entry_id, "denied", verdict.value)
-            return Dispatch(verdict.name, "denied", verdict.value, action.action_id)
+            return Dispatch(verdict.name, "denied", verdict.value, action.action_id,
+                            binding=binding)
 
         if wait > 0:
             # The budget has to cover the action's own length, not just the
@@ -557,6 +723,7 @@ class GameLens:
             action.action_id,
             churn=self._churn_since(before, outcome, settle),
             after_frame=marks[0] if injected else None,
+            binding=binding,
         )
 
     def _churn_since(self, before, outcome, settle: float) -> float | None:
@@ -654,6 +821,11 @@ class GameLens:
             "target": target,
             "capture": {
                 "backend": capture["backend"],
+                # Which capture session produced the frames, and whether
+                # failover is off: a caller scoring frames across an interval
+                # needs both to know every frame came from one source (GL039-R7).
+                "session_id": capture.get("session_id"),
+                "forced_backend": capture.get("forced_backend"),
                 "fps": self._fps(capture),
                 "age_ms": capture["age_ms"] if capture["age_ms"] != float("inf") else 9999,
                 "p95_age_ms": p95,

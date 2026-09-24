@@ -902,6 +902,9 @@ class CaptureSupervisor:
             return {
                 "backend": backend.kind.value if backend else "none",
                 "session_id": backend.session_id if backend else 0,
+                # Non-null only when failover is off -- the one case in which
+                # the backend cannot change under a caller mid-measurement.
+                "forced_backend": self._forced.value if self._forced else None,
                 "healthy": backend.healthy(self.deadline) if backend else False,
                 "distinct": backend.distinct if backend else 0,
                 "publish_rate": backend.publish_rate() if backend else 0.0,
