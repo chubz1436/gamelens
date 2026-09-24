@@ -73,6 +73,23 @@ FRAME_DEADLINE = 0.5
 # forever, and the supervisor that exists to replace it never fires.
 FIRST_FRAME_DEADLINE = 2.0
 
+# When every backend has failed, how long to wait before starting again from the
+# top of the order. A game that stops presenting for a moment -- Bedrock
+# generating a world draws nothing for seconds -- walks every backend past its
+# deadline in turn, and capture used to end there for good with the game
+# running normally a second later (GL-041). Growing, capped, never giving up.
+RETRY_BACKOFF = (1.0, 2.0, 5.0)
+
+# The transition history is for reading on the dashboard, and a retry loop now
+# appends to it for as long as the target stays dark.
+TRANSITIONS_KEPT = 64
+
+# How long a fallback backend must have been running before the supervisor
+# tries the top of the order again, and the ceiling that wait doubles up to
+# while the better backend keeps failing.
+PROMOTE_AFTER = 10.0
+PROMOTE_MAX = 160.0
+
 
 # --- buffer pool ----------------------------------------------------------
 
@@ -795,7 +812,10 @@ class CaptureSupervisor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.transitions: list[str] = []
+        self.transitions: deque[str] = deque(maxlen=TRANSITIONS_KEPT)
+        self._retries = 0
+        self._retry_at: float | None = None
+        self._promote_wait = PROMOTE_AFTER
 
     @property
     def backend(self) -> CaptureBackend | None:
@@ -850,40 +870,93 @@ class CaptureSupervisor:
             + (f"; last error {last_error!r}" if last_error else "")
         )
 
+    def _schedule_retry(self, exc: Exception) -> None:
+        delay = RETRY_BACKOFF[min(self._retries, len(RETRY_BACKOFF) - 1)]
+        self._retries += 1
+        self._retry_at = time.monotonic() + delay
+        self.transitions.append(f"all backends failed; retrying in {delay:g}s")
+        log.error("failover exhausted: %s; retrying from the top in %gs", exc, delay)
+
+    def _retry(self) -> None:
+        self._retry_at = None
+        try:
+            self._activate_from(0)
+        except RuntimeError as exc:
+            self._schedule_retry(exc)
+            return
+        self._retries = 0
+
+    def _drop(self, backend: CaptureBackend) -> None:
+        """Take a backend out of service; nothing it does afterwards is seen."""
+        # Retire *before* stopping. From this moment its publications are
+        # fenced off, so a call that returns late -- after failover -- cannot
+        # overwrite the replacement backend's frames while its own teardown
+        # is still in progress.
+        backend.retire()
+        with self._lock:
+            if self._backend is backend:
+                # Stop advertising it immediately. Leaving _backend pointing
+                # at a retired object lets an observation taken against it
+                # keep passing the arbiter's session check during failover.
+                self._backend = None
+        self.frames.clear()
+        threading.Thread(
+            target=backend.stop, name="gamelens-backend-teardown", daemon=True
+        ).start()
+
+    def _promote(self, backend: CaptureBackend) -> None:
+        """Leave a fallback for the top of the order, if the top works again.
+
+        Failover only ever moves down, and the bottom is mss -- which captures
+        whatever is on screen over the window. A few seconds of a game not
+        presenting used to leave it there for the life of the process
+        (GL-041). The cost of trying is one gap no longer than the first-frame
+        deadline, during which nothing is published and every action is
+        refused as stale. Each try doubles the wait before the next; only a top
+        backend that then stays healthy for PROMOTE_AFTER earns it back, since
+        one that starts and dies straight away looks like success at start.
+        """
+        self._promote_wait = min(self._promote_wait * 2, PROMOTE_MAX)
+        self.transitions.append(f"{backend.kind.value}: stepping back up to "
+                                f"{self._order[0].value}")
+        log.info("backend %s has been up %.0fs; trying %s again",
+                 backend.kind.value, time.monotonic() - backend.activated_at,
+                 self._order[0].value)
+        self._drop(backend)
+        try:
+            self._activate_from(0)
+        except RuntimeError as exc:
+            self._schedule_retry(exc)
+
     def _supervise(self) -> None:
         while not self._stop.wait(0.05):
             backend = self.backend
-            if backend is None or backend.healthy(self.deadline):
+            if backend is None:
+                # Nothing is published while this lasts, so every observation
+                # fails the arbiter's freshness check: dark, not unsafe.
+                if self._retry_at is not None and time.monotonic() >= self._retry_at:
+                    self._retry()
+                continue
+            if backend.healthy(self.deadline):
+                up_for = time.monotonic() - backend.activated_at
+                if self._index > 0 and up_for >= self._promote_wait:
+                    self._promote(backend)
+                elif self._index == 0 and up_for >= PROMOTE_AFTER:
+                    self._promote_wait = PROMOTE_AFTER
                 continue
 
             reason = backend.error or f"no frame for >{self.deadline}s"
             self.transitions.append(f"{backend.kind.value}: unhealthy ({reason})")
             log.error("backend %s unhealthy: %s", backend.kind.value, reason)
+            self._drop(backend)
 
-            # Retire *before* stopping. From this moment its publications are
-            # fenced off, so a call that returns late -- after failover -- cannot
-            # overwrite the replacement backend's frames while its own teardown
-            # is still in progress.
-            backend.retire()
-            with self._lock:
-                if self._backend is backend:
-                    # Stop advertising it immediately. Leaving _backend pointing
-                    # at a retired object lets an observation taken against it
-                    # keep passing the arbiter's session check during failover.
-                    self._backend = None
-            self.frames.clear()
-            threading.Thread(
-                target=backend.stop, name="gamelens-backend-teardown", daemon=True
-            ).start()
-
-            if self._forced:
-                log.error("backend forced to %s; not failing over", self._forced.value)
-                return
+            # A forced order holds one backend, so this goes straight to the
+            # retry, which restarts that same backend: forced means "never a
+            # different one", not "never again".
             try:
                 self._activate_from(self._index + 1)
             except RuntimeError as exc:
-                log.error("failover exhausted: %s", exc)
-                return
+                self._schedule_retry(exc)
 
     def stop(self) -> None:
         self._stop.set()
