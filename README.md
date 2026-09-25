@@ -126,20 +126,19 @@ These were open questions during the build. They are answered, not deferred.
 
 These are real and not worked around:
 
-- **WGC target identity is evidence, not proof.** `windows-capture` 1.4.2 binds by window
-  *title* and exposes no way to read back the HWND it bound. GameLens requires sole title
-  ownership before binding and re-verifies continuously, but ownership can still change in
-  the instant between the last check and the native bind. Use `--backend printwindow` when
-  you need HWND-exact capture.
+- **WGC binds by HWND only with `windows-capture` 2.0+.** 2.0.1 is pinned and takes
+  `window_hwnd`, so WGC is as exact as PrintWindow. An older install still binds by window
+  *title* with no HWND readback; GameLens then requires sole title ownership before binding
+  and on every frame, but ownership can change in the instant before the native bind. Never
+  use 2.0's `window_name` for this: it is a substring match.
 - **Games using RawInput with `RIDEV_NOLEGACY`, or anti-cheat, may ignore `SendInput`.** It
   is a documented user-mode API and GameLens does not try to defeat anything. No kernel
   drivers, no evasion. Whether automating a given game is permitted is your call.
 - **UIPI blocks injection into elevated windows** unless GameLens is elevated too. This
   surfaces as a `SendInput` short-count error rather than silent nothing.
 - **`windows-capture` 1.4.2 delivers padded frames twice** (`__init__.py:252` and `254-257`).
-  GameLens deduplicates on the native timespan. On this machine every frame is a padded one,
-  so without that the fps counter would read double and the reflex tier would process each
-  image twice.
+  2.0.1 delivers once (measured: 0 duplicates, published rate matching `/state`). GameLens
+  still deduplicates on the native timespan, which costs nothing on any version.
 - **Hiding WGC's yellow capture border needs Windows 11.** On Windows 10 the toggle throws,
   so GameLens does not ask for it.
 - **Windows emits no move event for a move to the pixel the cursor already occupies.** Measured

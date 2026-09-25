@@ -7,7 +7,8 @@ Three properties this module has to hold and which are easy to get wrong:
   while a consumer is mid-JPEG. Buffers are pooled and refcounted instead.
 * **A duplicate delivery is not a new frame.** windows-capture 1.4.2 invokes the
   frame handler twice for the same frame when the row pitch is padded, so frames
-  are deduplicated on the native timespan.
+  are deduplicated on the native timespan. 2.0 calls it once; the dedupe stays,
+  because it costs nothing and does not depend on the version.
 * **A blocked backend cannot wedge the pipeline.** PrintWindow is serviced by the
   target application and may never return, so it runs in a killable helper
   process supervised from outside, and results from a retired session are fenced
@@ -51,6 +52,27 @@ import sys as _sys
 WGC_BORDER_TOGGLE_SUPPORTED = (
     _sys.platform.startswith("win") and _sys.getwindowsversion().build >= 22000
 )
+
+_wgc_hwnd: bool | None = None
+
+
+def wgc_selects_by_hwnd() -> bool:
+    """Whether the installed windows-capture can bind a window by its HWND.
+
+    2.0 added ``window_hwnd``; 1.4.2 binds by title only, and 2.0 turned
+    ``window_name`` into a substring match, so the title path is kept only as
+    the fallback for an old install. Decided once, from the signature.
+    """
+    global _wgc_hwnd
+    if _wgc_hwnd is None:
+        try:
+            import inspect
+
+            from windows_capture import WindowsCapture
+            _wgc_hwnd = "window_hwnd" in inspect.signature(WindowsCapture).parameters
+        except Exception:
+            _wgc_hwnd = False
+    return _wgc_hwnd
 
 # Identity is verified on every published frame. An earlier revision throttled
 # the enumerating half to 4Hz on cost grounds, which was wrong twice over: the
@@ -489,10 +511,11 @@ class CaptureBackend:
 class WgcBackend(CaptureBackend):
     """Windows Graphics Capture via windows-capture.
 
-    Binds by window *title* because 1.4.2 exposes no HWND selector and no way to
-    read back the HWND it bound. Identity is therefore evidence, not proof: we
-    require sole title ownership before binding and re-verify on every frame, and
-    any failure stops capture rather than degrading quietly.
+    Binds by HWND when the library can (2.0+), which makes it as exact as
+    PrintWindow. On 1.4.2 it binds by window *title*, with no way to read back the
+    HWND it bound; identity is then evidence, not proof: we require sole title
+    ownership before binding and re-verify on every frame, and any failure stops
+    capture rather than degrading quietly.
     """
 
     kind = Backend.WGC
@@ -502,9 +525,10 @@ class WgcBackend(CaptureBackend):
         self._control = None
         self._checked_first_frame = False
         self.border_suppressed = False
+        self.by_hwnd = wgc_selects_by_hwnd()
 
     def start(self) -> None:
-        self.binding.verify(require_title_ownership=True)
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
         self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
         if not WGC_BORDER_TOGGLE_SUPPORTED:
             log.info(
@@ -519,11 +543,11 @@ class WgcBackend(CaptureBackend):
     def _open(self, *, draw_border: bool | None):
         from windows_capture import WindowsCapture
 
-        cap = WindowsCapture(
-            cursor_capture=False,
-            draw_border=draw_border,
-            window_name=self.binding.title,
-        )
+        if self.by_hwnd:
+            target = {"window_hwnd": self.binding.hwnd}
+        else:
+            target = {"window_name": self.binding.title}
+        cap = WindowsCapture(cursor_capture=False, draw_border=draw_border, **target)
 
         @cap.event
         def on_frame_arrived(frame, capture_control):  # noqa: ANN001
@@ -560,7 +584,7 @@ class WgcBackend(CaptureBackend):
                 )
             self._checked_first_frame = True
 
-        self.binding.verify(require_title_ownership=True)
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
         self._publish(array, getattr(frame, "timespan", 0) or 0)
 
     def stop(self) -> None:
@@ -852,10 +876,10 @@ class CaptureSupervisor:
             kind = self._order[i]
             cls = _BACKEND_CLASSES[kind]
 
-            if kind is Backend.WGC and not title_still_owned_by(
+            if kind is Backend.WGC and not wgc_selects_by_hwnd() and not title_still_owned_by(
                 self.binding.hwnd, self.binding.title
             ):
-                # Not an error: WGC binds by title, and the title is either
+                # Not an error: this WGC binds by title, and the title is either
                 # ambiguous or has moved to another window, so this backend
                 # simply is not usable for this target right now.
                 self.transitions.append(f"{kind.value}: skipped (title not solely owned)")
