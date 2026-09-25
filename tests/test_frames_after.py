@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
+from gamelens.activity import ActivityMap
 from gamelens.app import Dispatch, GameLens
 from gamelens.arbiter import Rejection
 from gamelens.capture import Backend, Frame, FramePool, LatestFrame
@@ -299,7 +300,7 @@ def test_a_stream_part_names_the_frame_that_was_encoded(frt):
 
 
 class _Registry:
-    def issue(self, observation, *, jpeg=None, quality=None) -> str:
+    def issue(self, observation, *, jpeg=None, quality=None, moving=None) -> str:
         return "obs"
 
 
@@ -314,6 +315,7 @@ def _encoder(slot: LatestFrame, *, fail: bool = False) -> GameLens:
 
     lens.arbiter = type("A", (), {"observation_for": staticmethod(observation_for)})()
     lens.observations = _Registry()
+    lens.activity = ActivityMap()
     return lens
 
 

@@ -31,6 +31,7 @@ from gamelens.app import (
     ObservationRegistry,
     same_at_click,
 )
+from gamelens.activity import ActivityMap
 from gamelens.arbiter import Arbiter
 from gamelens.server import ActionLog, Encoded, encode_jpeg
 from tests.test_arbiter import FakeBackend, FakeCapture, FakeExecutor, FakeTracker
@@ -72,6 +73,7 @@ def lens():
     lens.arbiter = Arbiter(capture, tracker, executor,
                            observation_deadline=LIMIT, action_ttl=LIMIT)
     lens.observations = ObservationRegistry()
+    lens.activity = ActivityMap()
     lens.log = ActionLog()
     capture.frames.frame = ArrFrame(1, scene())
     return lens
@@ -305,7 +307,8 @@ def test_a_click_rebind_without_the_shown_image_fails_closed(lens):
 def test_identical_images_score_zero():
     jpeg, _ = encode_jpeg(scene(), quality=50)
     got = same_at_click(jpeg, jpeg, *BUTTON)
-    assert got == {"patch_max": 0, "patch_mean": 0.0, "global_mad": 0.0, "ok": True}
+    assert got == {"patch_max": 0, "patch_mean": 0.0, "global_mad": 0.0, "still": 1.0,
+                   "ok": True}
 
 
 @pytest.mark.parametrize("junk", [b"", b"not a jpeg"])

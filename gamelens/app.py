@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from gamelens.activity import ActivityMap
 from gamelens.arbiter import ActionRejected, Arbiter, Rejection
 from gamelens.capture import Backend, CaptureSupervisor
 from gamelens.coords import GeometryTracker
@@ -65,6 +66,12 @@ PATCH_HALF = 16                # 33x33
 PATCH_MAX_DIFF = 12            # per pixel, per channel, 0-255
 PATCH_MEAN_DIFF = 1.0
 GLOBAL_MAD = 2.0
+
+# The whole-screen score is taken over the tiles that were not already moving
+# when the image was handed out (GL-042, see activity.py). Below this fraction
+# of still screen there is too little left to judge a swap by, and the score
+# falls back to the whole image -- the strict answer, as before.
+MIN_STILL = 0.10
 
 
 def _expected_duration(action) -> float:
@@ -155,15 +162,16 @@ class ObservationRegistry:
         self._lock = threading.Lock()
 
     def issue(self, observation, *, jpeg: bytes | None = None,
-              quality: int | None = None) -> str:
+              quality: int | None = None, moving=None) -> str:
         """Record what was handed out. ``jpeg`` and ``quality`` are the exact
         image the caller received, kept so a later rebind can compare the
-        pixels the decision was made on (GL039-R3); they live and die with the
-        record, so memory is bounded by the capacity."""
+        pixels the decision was made on (GL039-R3); ``moving`` is which tiles
+        were already animating at that moment (GL-042). They live and die with
+        the record, so memory is bounded by the capacity."""
         token = secrets.token_urlsafe(9)
         now = time.monotonic()
         with self._lock:
-            self._records[token] = (observation, now, jpeg, quality)
+            self._records[token] = (observation, now, jpeg, quality, moving)
             while len(self._records) > self._capacity:
                 self._records.popitem(last=False)
             # Opportunistic expiry; bounded work per issue.
@@ -177,26 +185,32 @@ class ObservationRegistry:
         return record[0] if record else None
 
     def record(self, token: str):
-        """``(observation, jpeg, quality)`` for a live record, else None."""
+        """``(observation, jpeg, quality, moving)`` for a live record, else None."""
         with self._lock:
             entry = self._records.get(token)
             if entry is None:
                 return None
-            observation, issued_at, jpeg, quality = entry
+            observation, issued_at, jpeg, quality, moving = entry
             if time.monotonic() - issued_at > self._ttl:
                 self._records.pop(token, None)
                 return None
-            return observation, jpeg, quality
+            return observation, jpeg, quality, moving
 
 
-def same_at_click(shown_jpeg: bytes, fresh_jpeg: bytes, x: float, y: float) -> dict:
+def same_at_click(shown_jpeg: bytes, fresh_jpeg: bytes, x: float, y: float,
+                  moving: np.ndarray | None = None) -> dict:
     """Is the screen at ``(x, y)`` still what the agent was shown?
 
     Both images are at the transport resolution the agent saw, and ``x, y`` is
-    in those pixels. Returns the scores and ``ok``; never raises for bad input,
-    it answers no.
+    in those pixels. ``moving`` is the tile map from the observation's record:
+    the whole-screen score skips those tiles, unless less than MIN_STILL of the
+    screen would be left. The patch is never masked -- a click on something
+    moving has to find it where it was. Returns the scores, ``still`` (the
+    fraction the global score was taken over) and ``ok``; never raises for bad
+    input, it answers no.
     """
-    out = {"patch_max": None, "patch_mean": None, "global_mad": None, "ok": False}
+    out = {"patch_max": None, "patch_mean": None, "global_mad": None, "still": None,
+           "ok": False}
     try:
         a = cv2.imdecode(np.frombuffer(shown_jpeg, np.uint8), cv2.IMREAD_COLOR)
         b = cv2.imdecode(np.frombuffer(fresh_jpeg, np.uint8), cv2.IMREAD_COLOR)
@@ -213,7 +227,20 @@ def same_at_click(shown_jpeg: bytes, fresh_jpeg: bytes, x: float, y: float) -> d
                  max(0, cx - PATCH_HALF):cx + PATCH_HALF + 1]
     out["patch_max"] = int(patch.max())
     out["patch_mean"] = round(float(patch.mean()), 3)
-    out["global_mad"] = round(float(diff.mean()), 3)
+    still = None
+    if moving is not None and moving.any():
+        try:
+            mask = cv2.resize(moving.astype(np.uint8), (w, h),
+                              interpolation=cv2.INTER_NEAREST) == 0
+        except Exception:
+            return out
+        if mask.mean() >= MIN_STILL:
+            still = mask
+        out["still"] = round(float(mask.mean()), 3)
+    else:
+        out["still"] = 1.0
+    scored = diff if still is None else diff[still]
+    out["global_mad"] = round(float(scored.mean()), 3)
     out["ok"] = (out["patch_max"] <= PATCH_MAX_DIFF
                  and out["patch_mean"] <= PATCH_MEAN_DIFF
                  and out["global_mad"] <= GLOBAL_MAD)
@@ -266,6 +293,7 @@ class GameLens:
         self._poller: threading.Thread | None = None
 
         self.observations = ObservationRegistry()
+        self.activity = ActivityMap()
 
         self.agent = None          # set by attach_agent
         self._agent_intent = ""
@@ -312,6 +340,12 @@ class GameLens:
                 if frame.frame_id != self._last_frame_id:
                     self._last_frame_id = frame.frame_id
                     self._frame_times.append(time.monotonic())
+                    try:
+                        self.activity.feed(frame.array, frame.frame_id)
+                    except Exception:
+                        # Without a map the rebind scores the whole screen:
+                        # stricter, never looser. Not worth losing the poller.
+                        log.debug("activity feed failed", exc_info=True)
                 self._frame_ages.append(frame.age() * 1000)
             finally:
                 frame.release()
@@ -374,7 +408,8 @@ class GameLens:
                 return NO_FRAME
             jpeg, scale = encode_jpeg(frame.array, quality=quality)
             observation = self.arbiter.observation_for(frame, scale=scale)
-            token = self.observations.issue(observation, jpeg=jpeg, quality=quality)
+            token = self.observations.issue(observation, jpeg=jpeg, quality=quality,
+                                            moving=self.activity.snapshot())
             return Encoded(jpeg, token, frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
@@ -567,7 +602,7 @@ class GameLens:
             detail = f"observation {observation_id[:8]}... is unknown or expired"
             self.log.add(f"{label}: {detail}", "denied")
             return Dispatch(Rejection.STALE_OBSERVATION.name, "denied", detail)
-        shown, shown_jpeg, quality = record
+        shown, shown_jpeg, quality, moving = record
         if not rebind:
             return shown, None
         if self.arbiter.is_fresh(shown):
@@ -590,7 +625,8 @@ class GameLens:
                         detail = "no image on record to compare the click point against"
                     else:
                         fresh_jpeg, scale = encode_jpeg(frame.array, quality=quality or 70)
-                        checks = [same_at_click(shown_jpeg, fresh_jpeg, *p) for p in points]
+                        checks = [same_at_click(shown_jpeg, fresh_jpeg, *p, moving=moving)
+                                  for p in points]
                         # The worst point speaks for all of them. A point that
                         # could not be compared at all (None scores) is worst.
                         same = next((c for c in checks if c["patch_max"] is None), None)                             or max(checks, key=lambda c: (c["patch_max"], c["patch_mean"]))
