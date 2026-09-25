@@ -327,3 +327,28 @@ def test_a_click_outside_the_image_answers_no(x, y):
 def test_the_patch_is_clipped_at_the_edge():
     jpeg, _ = encode_jpeg(scene(), quality=50)
     assert same_at_click(jpeg, jpeg, 0, 0)["ok"] is True
+
+
+# --- GL041-I02: a frame from a backend no longer in service is not handed out ------
+
+
+def test_a_frame_from_a_retired_backend_is_not_shown(lens):
+    from gamelens.server import NO_FRAME
+
+    lens.capture.backend.retired = True
+    assert GameLens.encode_frame(lens, 50) is NO_FRAME
+
+
+def test_a_frame_from_another_session_is_not_shown(lens):
+    from gamelens.server import NO_FRAME
+    from tests.test_arbiter import FakeBackend
+
+    lens.capture.backend = FakeBackend(2)            # frame is session 1
+    assert GameLens.encode_frame(lens, 50) is NO_FRAME
+
+
+def test_no_backend_in_service_shows_nothing(lens):
+    from gamelens.server import NO_FRAME
+
+    lens.capture.backend = None
+    assert GameLens.encode_frame(lens, 50) is NO_FRAME

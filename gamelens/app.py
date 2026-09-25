@@ -341,7 +341,8 @@ class GameLens:
                     self._last_frame_id = frame.frame_id
                     self._frame_times.append(time.monotonic())
                     try:
-                        self.activity.feed(frame.array, frame.frame_id)
+                        self.activity.feed(frame.array, frame.frame_id,
+                                           frame.session_id)
                     except Exception:
                         # Without a map the rebind scores the whole screen:
                         # stricter, never looser. Not worth losing the poller.
@@ -406,16 +407,32 @@ class GameLens:
         try:
             if min_frame_id is not None and frame.frame_id < min_frame_id:
                 return NO_FRAME
+            if not self._from_live_backend(frame):
+                return NO_FRAME
             jpeg, scale = encode_jpeg(frame.array, quality=quality)
             observation = self.arbiter.observation_for(frame, scale=scale)
             token = self.observations.issue(observation, jpeg=jpeg, quality=quality,
-                                            moving=self.activity.snapshot())
+                                            moving=self.activity.snapshot(
+                                                frame.frame_id, frame.session_id))
             return Encoded(jpeg, token, frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
             return ENCODE_FAILED
         finally:
             frame.release()
+
+    def _from_live_backend(self, frame) -> bool:
+        """Is ``frame`` from the backend in service now (GL041-I02)?
+
+        A backend being dropped is retired before its frame leaves the slot, so
+        for a moment the slot can hand out a frame of a capture that is no
+        longer running -- more often now that a healthy fallback is dropped to
+        step back up. The arbiter already refuses actions on it; this keeps it
+        from being shown at all.
+        """
+        backend = self.capture.backend
+        return (backend is not None and not getattr(backend, "retired", False)
+                and backend.session_id == frame.session_id)
 
     def encode_latest(self, quality: int = 70) -> tuple[bytes | None, str]:
         """``encode_frame`` for callers that only want ``(jpeg, observation_id)``."""

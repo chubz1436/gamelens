@@ -500,3 +500,65 @@ def test_the_game_flag_defaults_to_java_and_refuses_anything_else(monkeypatch, t
         assert seen["game"] == want
     with pytest.raises(SystemExit):
         probe.main([str(tmp_path / "o"), "--token-file", str(tok), "--game", "roblox"])
+
+
+# --- Codex, 2026-09-25 ------------------------------------------------------------
+
+
+def test_a_menu_still_on_its_way_is_not_unsupported():
+    """GL043-I01: Bedrock animates its menus. The first frame after E can still
+    show the world; the inventory arrives a frame later. One frame of world is
+    not evidence that E was ignored."""
+    io = FakeIO()
+    pending = {"menu_in": None}
+
+    def react(io, msg, wp):
+        if msg == probe.WM_KEYDOWN and wp == probe.VK_E:
+            pending["menu_in"] = 2               # two frame reads from now
+
+    real_frame = io.frame
+
+    def frame(after=None):
+        if pending["menu_in"] is not None:
+            pending["menu_in"] -= 1
+            if pending["menu_in"] <= 0:
+                io.screen, pending["menu_in"] = MENU, None
+        return real_frame(after)
+
+    io.react, io.frame = react, frame
+    (e,) = [c for c in run(io, trials=1)["cases"] if c["name"] == "e_inventory"]
+    assert e["verdict"] != "unsupported"
+
+
+def test_e_ignored_on_two_frames_is_still_unsupported():
+    io = FakeIO()                                # E does nothing at all
+    (e,) = [c for c in run(io, trials=1)["cases"] if c["name"] == "e_inventory"]
+    assert e["verdict"] == "unsupported"
+
+
+def test_a_missing_mid_interval_control_makes_the_trial_inconclusive():
+    """GL040-RV02-I01: without the control's mid-hold frame, a centre-only flash
+    caught by the input's mid-hold frame had nothing to beat."""
+    io = FakeIO()
+    real_frame = io.frame
+    calls = {"after": 0}
+
+    def frame(after=None):
+        if after is not None:
+            calls["after"] += 1
+            if calls["after"] == 1:              # the control's mid-interval frame
+                io.fid += 1
+                return None, io.fid
+        return real_frame(after)
+
+    io.frame = frame
+    p = probe.Probe(io, trials=1)
+    p.session = io.session
+    verdict, reason, _ = p._trial("t", lambda: None, lambda: None, 1.0,
+                                  lambda b, a, c: (True, {}), mid_at=0.5)
+    assert verdict == "inconclusive" and "mid-interval" in reason
+
+
+def test_bedrock_waits_long_enough_for_its_menus():
+    assert probe.AFTER_FRAMES_BY_GAME["java"] == probe.AFTER_FRAMES
+    assert probe.AFTER_FRAMES_BY_GAME["bedrock"] >= 13      # measured fade-out

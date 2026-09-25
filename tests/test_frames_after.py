@@ -306,7 +306,8 @@ class _Registry:
 
 def _encoder(slot: LatestFrame, *, fail: bool = False) -> GameLens:
     lens = object.__new__(GameLens)
-    lens.capture = type("C", (), {"frames": slot})()
+    lens.capture = type("C", (), {"frames": slot,
+                                  "backend": type("B", (), {"session_id": 1})()})()
 
     def observation_for(frame, scale):
         if fail:

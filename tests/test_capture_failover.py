@@ -31,11 +31,16 @@ class World:
         self.blocked: set[str] = set()     # kinds that refuse to start
         self.dark: set[str] = set()        # kinds that start but never produce
         self.lives: dict[str, float] = {}  # kinds that produce only this long
+        self.slow: dict[str, float] = {}   # kinds whose start takes this long
+        self.hang = None                   # an Event every stop() waits on, if set
+        self.instances: list = []
 
 
 def fake_class(kind: Backend, world: World):
     class Fake(capture.CaptureBackend):
         def start(self):
+            world.instances.append(self)
+            time.sleep(world.slow.get(kind.value, 0))
             if not world.can_start or kind.value in world.blocked:
                 raise OSError("nothing to capture")
             world.started.append(kind.value)
@@ -43,6 +48,8 @@ def fake_class(kind: Backend, world: World):
 
         def stop(self):
             self.retire()
+            if world.hang is not None:
+                world.hang.wait()
 
         def healthy(self, deadline=capture.FRAME_DEADLINE):
             life = world.lives.get(kind.value)
@@ -249,4 +256,39 @@ def test_transition_history_is_bounded(world):
             sup._schedule_retry(RuntimeError("x"))
         assert len(sup.transitions) == capture.TRANSITIONS_KEPT
     finally:
+        sup.stop()
+
+
+# --- GL041-I01 / I03 (Codex) ---------------------------------------------------------
+
+
+def test_a_start_that_outlasts_stop_is_not_left_running(world):
+    """stop() joins the supervisor for 1 s; a start still running after that
+    must not install a live backend nobody supervises."""
+    sup = supervisor()
+    world.slow = {"printwindow": 1.6}
+    world.dark = {"wgc"}
+    assert wait_for(lambda: any(i.kind is Backend.PRINTWINDOW for i in world.instances))
+    sup.stop()                                   # returns while printwindow starts
+    time.sleep(1.2)
+    assert sup.backend is None
+    late = [i for i in world.instances if i.kind is Backend.PRINTWINDOW][0]
+    assert late.retired
+
+
+def test_hung_teardowns_stop_new_starts_until_they_return(world):
+    import threading
+
+    world.hang = threading.Event()
+    world.blocked = {"printwindow", "mss"}
+    world.dark = {"wgc"}
+    sup = supervisor()
+    try:
+        assert wait_for(lambda: world.started.count("wgc") >= capture.MAX_PENDING_TEARDOWNS)
+        time.sleep(1.0)                          # several retry periods
+        assert world.started.count("wgc") == capture.MAX_PENDING_TEARDOWNS
+        world.hang.set()                         # the stuck stops return
+        assert wait_for(lambda: world.started.count("wgc") > capture.MAX_PENDING_TEARDOWNS)
+    finally:
+        world.hang.set()
         sup.stop()

@@ -62,6 +62,11 @@ VK_W, VK_E = 0x57, 0x45
 
 SAFE_BACKENDS = ("wgc", "printwindow")
 AFTER_FRAMES = 3                # bot.AFTER_FRAMES, measured on printwindow
+# Frames to wait after the input before judging, per edition. Java's 3 is the
+# render lag of a camera turn. Bedrock animates its menus: the pause menu took 4
+# frames to appear and 11-13 to fade out on the VM at 32 fps (2026-09-25), and a
+# judgement taken earlier sees the old screen (GL043-I01, Codex).
+AFTER_FRAMES_BY_GAME = {"java": AFTER_FRAMES, "bedrock": 15}
 MARGIN = 3.0                    # churn over the case's own control that counts as an effect
 THUMB = (64, 36)
 
@@ -262,9 +267,13 @@ class Probe:
         else:
             self._sleep(duration)
         before = self._frame_after_now()
-        if before is None:
-            self.poisoned = f"{name}: no control frame"
-            return "inconclusive", "no control frame", {}
+        if before is None or (mid_at is not None and control_mid is None):
+            # A missing mid-interval control is not "the centre did not move":
+            # without it the input's mid-hold frame has nothing to beat
+            # (GL040-RV02-I01, Codex).
+            what = "no control frame" if before is None else "no mid-interval control frame"
+            self.poisoned = f"{name}: {what}"
+            return "inconclusive", what, {}
         control = churn(start, before)
         # The most the centre moved on its own, at either sample.
         control_centre = max(centre_churn(start, f)[0]
@@ -362,6 +371,14 @@ class Probe:
             # The one case allowed to say "unsupported": in the world, an
             # accepted E always opens the inventory, so no change here is
             # evidence rather than an unlucky stimulus (contrast GL039-I09).
+            # A strong claim from one frame, so a second, later frame has to
+            # agree -- a menu still on its way reads as the world (GL043-I01).
+            again = self._frame_after_now()
+            if again is None or not self.io.in_world(again):
+                self.poisoned = f"{name}: the screen was not steady after the input"
+                result.reason = ("the world showed after the input and then did not; a "
+                                 "menu may have been on its way")
+                return result
             result.verdict = "unsupported"
             return result
         self._inject(restore_inject, restore_release)
@@ -468,6 +485,7 @@ class LiveIO:
 
         self._play, self._api, self._gui = play, win32api, win32gui
         self._in_world = IN_WORLD[game](screens)
+        self.after_frames = AFTER_FRAMES_BY_GAME[game]
         self.url, self.token, self.out = url, token, out
         play.BASE = url
         state = self.state()
@@ -483,7 +501,7 @@ class LiveIO:
     def frame(self, after=None):
         path = "/frame.jpg?quality=90"
         if after is not None:
-            path += f"&after={after}&frames={AFTER_FRAMES}&wait_ms=2000"
+            path += f"&after={after}&frames={self.after_frames}&wait_ms=2000"
         status, body, headers = self._play.req(path, self.token)
         if status != 200:
             return None, None

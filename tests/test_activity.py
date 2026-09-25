@@ -32,9 +32,13 @@ def with_band(img: np.ndarray, phase: int, top: int = 0, height: int = 40) -> np
     return out
 
 
-def feed_run(amap: ActivityMap, frames, start: float = 100.0, step: float = 0.05):
+RUN = 45           # frames at 20 Hz: a little over the 2 s window
+
+
+def feed_run(amap: ActivityMap, frames, start: float = 100.0, step: float = 0.05,
+             session: int = 0):
     for i, f in enumerate(frames):
-        amap.feed(f, i + 1, now=start + i * step)
+        amap.feed(f, i + 1, session, now=start + i * step)
     return start + (len(frames) - 1) * step
 
 
@@ -44,7 +48,7 @@ def feed_run(amap: ActivityMap, frames, start: float = 100.0, step: float = 0.05
 def test_a_still_screen_has_nothing_moving():
     amap = ActivityMap()
     now = feed_run(amap, [scene()] * 10)
-    moving = amap.snapshot(now)
+    moving = amap.snapshot(now=now)
     assert moving is not None and not moving.any()
 
 
@@ -57,19 +61,19 @@ def test_no_history_means_no_map():
 
 def test_the_moving_band_is_marked_and_the_rest_is_not():
     amap = ActivityMap(dilate=0)
-    now = feed_run(amap, [with_band(scene(), i) for i in range(10)])
-    moving = amap.snapshot(now)
+    now = feed_run(amap, [with_band(scene(), i) for i in range(RUN)])
+    moving = amap.snapshot(now=now)
     assert moving[: 40 // T].all()
     assert not moving[80 // T:].any()
 
 
 def test_dilation_widens_by_one_tile():
-    frames = [with_band(scene(), i, top=160, height=16) for i in range(10)]
+    frames = [with_band(scene(), i, top=160, height=16) for i in range(RUN)]
     rows = {}
     for d in (0, 1):
         amap = ActivityMap(dilate=d)
         now = feed_run(amap, frames)
-        rows[d] = np.flatnonzero(amap.snapshot(now).any(axis=1)).tolist()
+        rows[d] = np.flatnonzero(amap.snapshot(now=now).any(axis=1)).tolist()
     assert rows[0] and rows[1] == list(range(rows[0][0] - 1, rows[0][-1] + 2))
 
 
@@ -77,23 +81,23 @@ def test_motion_older_than_the_window_is_forgotten():
     amap = ActivityMap(window=1.0)
     frames = [with_band(scene(), i) for i in range(5)] + [scene()] * 31
     now = feed_run(amap, frames)             # 36 frames, 1.75 s
-    assert not amap.snapshot(now).any()
+    assert not amap.snapshot(now=now).any()
 
 
 def test_a_frame_id_seen_twice_counts_once():
     amap = ActivityMap()
-    amap.feed(scene(), 1, now=1.0)
-    amap.feed(with_band(scene(), 3), 1, now=1.05)   # same id: ignored
-    amap.feed(scene(), 2, now=1.1)
-    assert not amap.snapshot(1.1).any()
+    amap.feed(scene(), 1, 0, now=1.0)
+    amap.feed(with_band(scene(), 3), 1, 0, now=1.05)   # same id: ignored
+    amap.feed(scene(), 2, 0, now=1.1)
+    assert not amap.snapshot(now=1.1).any()
 
 
 def test_a_size_change_starts_the_history_again():
     amap = ActivityMap()
     feed_run(amap, [with_band(scene(), i) for i in range(5)])
     small = cv2.resize(scene(), (W // 2, H // 2))
-    amap.feed(small, 99, now=101.0)
-    assert amap.snapshot(101.0) is None
+    amap.feed(small, 99, 0, now=101.0)
+    assert amap.snapshot(now=101.0) is None
 
 
 # --- same_at_click with a map ----------------------------------------------------
@@ -101,8 +105,8 @@ def test_a_size_change_starts_the_history_again():
 
 def band_map(top=0, height=40) -> np.ndarray:
     amap = ActivityMap()
-    now = feed_run(amap, [with_band(scene(), i, top, height) for i in range(10)])
-    return amap.snapshot(now)
+    now = feed_run(amap, [with_band(scene(), i, top, height) for i in range(RUN)])
+    return amap.snapshot(now=now)
 
 
 def jpg(img):
@@ -169,10 +173,18 @@ def test_the_patch_is_never_masked():
 # --- end to end through _bind ------------------------------------------------------
 
 
+def _animate(lens, frames=RUN):
+    """Feed the map a band animating for the whole window, ending now, with ids
+    below the frame about to be handed out, from its session."""
+    t0 = time.monotonic() - (frames - 1) * 0.05
+    for i in range(frames):
+        lens.activity.feed(with_band(scene(), i), 100 + i, 1, now=t0 + i * 0.05)
+    lens.capture.frames.frame = type(lens.capture.frames.frame)(
+        200, with_band(scene(), frames), 1)
+
+
 def test_a_late_click_on_an_animated_menu_is_rebound(lens):  # noqa: F811
-    for i in range(8):
-        lens.capture.frames.frame.array = with_band(scene(), i)
-        lens.activity.feed(lens.capture.frames.frame.array, 100 + i)
+    _animate(lens)
     token = shown(lens)
     later(lens, with_band(scene(), 20))
     obs, binding = GameLens._bind(lens, token, "t", True, points=[BUTTON])
@@ -190,7 +202,7 @@ def test_the_same_late_click_without_a_map_is_refused(lens):  # noqa: F811
 def test_memory_is_bounded_by_the_window():
     amap = ActivityMap(window=1.0)
     feed_run(amap, [scene()] * 200)          # 10 s at 20 Hz
-    assert len(amap._maps) <= 21
+    assert len(amap._samples) <= 21
 
 
 def test_drift_too_slow_between_samples_is_caught_across_the_window():
@@ -198,10 +210,111 @@ def test_drift_too_slow_between_samples_is_caught_across_the_window():
     under the threshold per 50 ms sample and added up over seconds."""
     amap = ActivityMap(dilate=0)
     frames = []
-    for i in range(20):
+    for i in range(RUN):
         f = scene()
         f[:40, :, :3] = 100 + i // 2            # +0.5 per sample on average
         frames.append(f)
     now = feed_run(amap, frames)
-    moving = amap.snapshot(now)
+    moving = amap.snapshot(now=now)
     assert moving[: 40 // T].all() and not moving[80 // T:].any()
+
+
+# --- GL042-I01: moving throughout, not moved once ----------------------------------
+
+
+def test_a_burst_of_change_is_not_ongoing_motion():
+    """A page transition: everything changes once, then nothing. Counting it as
+    motion would hide the content a second swap replaces."""
+    amap = ActivityMap()
+    other = scene()
+    other[:, :, :3] = 255 - other[:, :, :3]
+    frames = [scene()] * 25 + [other] * 20     # instant swap 1.25 s in, then still
+    now = feed_run(amap, frames)
+    assert not amap.snapshot(now=now).any()
+
+
+def test_motion_seen_only_in_part_of_the_window_is_not_enough():
+    amap = ActivityMap()
+    frames = [scene()] * 25 + [with_band(scene(), i) for i in range(20)]   # last 1 s
+    now = feed_run(amap, frames)
+    assert not amap.snapshot(now=now).any()
+
+
+def test_a_short_history_marks_nothing():
+    amap = ActivityMap()
+    now = feed_run(amap, [with_band(scene(), i) for i in range(12)])      # 0.55 s
+    assert not amap.snapshot(now=now).any()
+
+
+# --- GL042-I02: the map belongs to the frame handed out ------------------------------
+
+
+def test_samples_after_the_handed_out_frame_do_not_count():
+    """The encoder leased frame F; the poller then fed a swap. The swap must not
+    be in F's map."""
+    amap = ActivityMap()
+    now = feed_run(amap, [with_band(scene(), i) for i in range(RUN)])
+    assert amap.snapshot(until_frame_id=RUN, now=now).any()
+    assert not amap.snapshot(until_frame_id=RUN // 2, now=now).any()
+    assert amap.snapshot(until_frame_id=1, now=now) is None       # one sample
+
+
+def test_another_session_gets_no_map():
+    amap = ActivityMap()
+    now = feed_run(amap, [with_band(scene(), i) for i in range(RUN)], session=3)
+    assert amap.snapshot(session_id=3, now=now).any()
+    assert amap.snapshot(session_id=4, now=now) is None
+
+
+def test_a_new_session_starts_the_history_again():
+    amap = ActivityMap()
+    feed_run(amap, [with_band(scene(), i) for i in range(RUN)], session=3)
+    amap.feed(scene(), 999, 4, now=103.0)
+    assert amap.snapshot(session_id=4, now=103.0) is None
+
+
+def test_a_native_size_change_starts_again_even_with_the_same_tile_grid():
+    amap = ActivityMap()
+    feed_run(amap, [with_band(scene(), i) for i in range(RUN)])
+    bigger = cv2.resize(scene(), (W + 4, H + 4))      # same W//16, H//16
+    assert (bigger.shape[1] // T, bigger.shape[0] // T) == (W // T, H // T)
+    amap.feed(bigger, 999, 0, now=103.0)
+    assert amap.snapshot(now=103.0) is None
+
+
+def test_encode_frame_takes_the_map_of_its_own_frame(lens):  # noqa: F811
+    """End to end: samples fed after the handed-out frame's id are ignored."""
+    _animate(lens)
+    lens.capture.frames.frame = type(lens.capture.frames.frame)(
+        50, with_band(scene(), 0), 1)                 # older than every sample fed
+    token = shown(lens)
+    assert lens.observations.record(token)[3] is None
+
+
+def test_encode_frame_gets_no_map_from_another_session(lens):  # noqa: F811
+    from tests.test_arbiter import FakeBackend
+
+    _animate(lens)
+    lens.capture.backend = FakeBackend(2)
+    lens.capture.frames.frame = type(lens.capture.frames.frame)(
+        300, with_band(scene(), 0), 2)                # session 2, map is session 1
+    token = shown(lens)
+    assert lens.observations.record(token)[3] is None
+
+
+def test_the_poller_feeds_the_map_with_the_frame_session(lens):  # noqa: F811
+    import threading
+    from collections import deque
+
+    lens._stop = threading.Event()
+    lens._last_frame_id = 0
+    lens._frame_times, lens._frame_ages = deque(maxlen=120), deque(maxlen=120)
+    frame = type(lens.capture.frames.frame)(7, scene(), 5)
+    frame.age = lambda: 0.0
+    lens.capture.frames.frame = frame
+    t = threading.Thread(target=GameLens._poll, args=(lens,), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    lens._stop.set()
+    t.join(1.0)
+    assert lens.activity._source is not None and lens.activity._source[0] == 5

@@ -90,6 +90,12 @@ TRANSITIONS_KEPT = 64
 PROMOTE_AFTER = 10.0
 PROMOTE_MAX = 160.0
 
+# Teardowns run on their own threads because a backend's stop can hang (WGC's
+# native stop has). Each drop starts one, and with retries a hung stop would
+# leave one more thread and native session behind every few seconds; past this
+# many unfinished, no new backend is started until they return (GL041-I03).
+MAX_PENDING_TEARDOWNS = 3
+
 
 # --- buffer pool ----------------------------------------------------------
 
@@ -816,6 +822,7 @@ class CaptureSupervisor:
         self._retries = 0
         self._retry_at: float | None = None
         self._promote_wait = PROMOTE_AFTER
+        self._teardowns: list[threading.Thread] = []
 
     @property
     def backend(self) -> CaptureBackend | None:
@@ -832,7 +839,13 @@ class CaptureSupervisor:
     def _activate_from(self, index: int) -> None:
         """Bring up the first backend at or after *index* that starts cleanly."""
         last_error: Exception | None = None
+        self._teardowns = [t for t in self._teardowns if t.is_alive()]
+        if len(self._teardowns) >= MAX_PENDING_TEARDOWNS:
+            raise RuntimeError(f"{len(self._teardowns)} backend teardowns have not returned; "
+                               "not starting another capture on top of them")
         for i in range(index, len(self._order)):
+            if self._stop.is_set():
+                raise RuntimeError("capture is stopping")
             kind = self._order[i]
             cls = _BACKEND_CLASSES[kind]
 
@@ -859,8 +872,17 @@ class CaptureSupervisor:
                 continue
 
             with self._lock:
-                self._backend = backend
-                self._index = i
+                # Checked under the lock stop() reads the backend under
+                # (GL041-I01): a start that outlasts stop()'s join must not
+                # install a live, unsupervised backend after shutdown.
+                stopping = self._stop.is_set()
+                if not stopping:
+                    self._backend = backend
+                    self._index = i
+            if stopping:
+                backend.retire()
+                self._reap(backend)
+                raise RuntimeError("capture stopped while a backend was starting")
             self.transitions.append(f"{kind.value}: active (session {backend.session_id})")
             log.info("capture backend %s active (session %d)", kind.value, backend.session_id)
             return
@@ -900,9 +922,13 @@ class CaptureSupervisor:
                 # keep passing the arbiter's session check during failover.
                 self._backend = None
         self.frames.clear()
-        threading.Thread(
-            target=backend.stop, name="gamelens-backend-teardown", daemon=True
-        ).start()
+        self._reap(backend)
+
+    def _reap(self, backend: CaptureBackend) -> None:
+        t = threading.Thread(target=backend.stop, name="gamelens-backend-teardown",
+                             daemon=True)
+        self._teardowns.append(t)
+        t.start()
 
     def _promote(self, backend: CaptureBackend) -> None:
         """Leave a fallback for the top of the order, if the top works again.
@@ -963,8 +989,10 @@ class CaptureSupervisor:
         t = self._thread
         if t:
             t.join(timeout=1.0)
-        backend = self.backend
+        with self._lock:
+            backend, self._backend = self._backend, None
         if backend:
+            backend.retire()
             backend.stop()
         self.frames.clear()
 
