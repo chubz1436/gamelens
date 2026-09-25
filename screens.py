@@ -283,3 +283,55 @@ def in_world(arr):
                 if inside.size and inside.mean() < 0.4:
                     return True
     return False
+
+
+# Bedrock scales its HUD with the window, so the hotbar is not at a fixed
+# fraction of the frame the way `in_world` assumes: at 1366x720 in the test VM
+# it sits lower and narrower than HOTBAR, and `in_world` answered False in the
+# world on every frame. What does hold across sizes is its shape.
+BEDROCK_BAND = 0.84           # search below this fraction of the height...
+BEDROCK_SPAN = (0.2, 0.8)     # ...and between these fractions of the width
+BEDROCK_SLOT = (0.025, 0.08)  # outline side, as a fraction of the width
+BEDROCK_FILL = (0.18, 0.45)   # bright share of the outline's bounding box
+
+
+def bedrock_in_world(arr):
+    """True when Bedrock's live world is on screen, not a menu drawn over it.
+
+    Same signal as `in_world` -- the selected hotbar slot's bright outline,
+    which Bedrock hides for the pause menu, inventory, chat, dialogs and with
+    F1, and dims while a menu fades in or out -- found by shape instead of by
+    position: exactly one hollow, square, bright, unsaturated outline touching
+    the bottom of the frame. The fill bounds are what separate it from the
+    inventory grid, whose slot borders are hollow squares too but thin (0.08 to
+    0.11 of their box against 0.25 to 0.33), and from anything filled in.
+
+    Calibrated on Bedrock 26.51 at two window sizes (1280 and 1185 wide frames):
+    world with and without an item selected, any slot, a tutorial toast, F5
+    camera -- positive; pause menu, inventory with items, chat, trial dialog,
+    F1, and pause or inventory still fading -- negative. The first frame of an
+    inventory fading in can still read positive; one frame later it does not.
+    """
+    if arr is None:
+        return False
+    h, w = arr.shape[:2]
+    y0 = int(h * BEDROCK_BAND)
+    x0, x1 = int(w * BEDROCK_SPAN[0]), int(w * BEDROCK_SPAN[1])
+    band = arr[y0:, x0:x1, :3]
+    if band.size == 0:
+        return False
+    hsv = cv2.cvtColor(np.ascontiguousarray(band), cv2.COLOR_BGR2HSV)
+    bright = ((hsv[:, :, 2] >= 170) & (hsv[:, :, 1] <= 60)).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
+    found = 0
+    for i in range(1, n):
+        x, y, bw, bh, area = stats[i]
+        if not (BEDROCK_SLOT[0] * w <= bw <= BEDROCK_SLOT[1] * w):
+            continue
+        if not 0.8 <= bw / max(bh, 1) <= 1.25:
+            continue
+        if y0 + y + bh < 0.95 * h:
+            continue
+        if BEDROCK_FILL[0] <= area / (bw * bh) <= BEDROCK_FILL[1]:
+            found += 1
+    return found == 1

@@ -470,3 +470,33 @@ def test_an_animation_seen_only_mid_interval_is_matched_by_the_control_mid_sampl
     assert trial["control"] <= probe.MARGIN
     assert trial["control_centre"] > probe.MARGIN, "the control saw the mid-interval flash"
     assert case["verdict"] != "supported"
+
+
+def test_each_edition_gets_its_own_in_world_probe():
+    import screens
+
+    assert probe.IN_WORLD["java"](screens) is screens.in_world
+    assert probe.IN_WORLD["bedrock"](screens) is screens.bedrock_in_world
+
+
+def test_the_game_flag_defaults_to_java_and_refuses_anything_else(monkeypatch, tmp_path):
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_io(url, token, out, game):
+        seen["game"] = game
+        raise Stop
+
+    monkeypatch.setattr(probe, "LiveIO", fake_io)
+    tok = tmp_path / "t"
+    tok.write_text("x")
+    for argv, want in ([[str(tmp_path / "o"), "--token-file", str(tok)], "java"],
+                       [[str(tmp_path / "o"), "--token-file", str(tok), "--game", "bedrock"],
+                        "bedrock"]):
+        with pytest.raises(Stop):
+            probe.main(argv)
+        assert seen["game"] == want
+    with pytest.raises(SystemExit):
+        probe.main([str(tmp_path / "o"), "--token-file", str(tok), "--game", "roblox"])

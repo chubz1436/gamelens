@@ -1,12 +1,15 @@
 """Does the game act on input posted to its window while it is NOT focused?
 
     .venv/Scripts/python.exe tools/bg_input_probe.py OUT_DIR [--url URL] [--token-file PATH]
+                                                     [--game java|bedrock]
 
-Minecraft **Java Edition** only: its cases (E opens the inventory, a held left
-button cracks the block under the crosshair) and its paused-world check
-(`screens.in_world`) are that game's. On Bedrock the check false-positives on the
-pause menu, so a verdict there is not evidence (2026-09-24). The agent controls
-themselves are game-agnostic; this is one experiment about one game.
+Minecraft only: its cases (E opens the inventory, a held left button cracks the
+block under the crosshair) hold in both editions, and the in-the-world check is
+chosen with --game -- `screens.in_world` for Java, `screens.bedrock_in_world`
+for Bedrock. The Java probe must not be used on Bedrock: Bedrock scales its HUD
+with the window, so at some sizes the Java probe looks at the wrong band and at
+others it reads a pause menu still fading in as the world (2026-09-24/25). The
+agent controls themselves are game-agnostic; this is one experiment about one game.
 
 GL-039 part B1. The 2026-09-22 attempt concluded "no" -- every case sat at the
 baseline -- but Minecraft's `pauseOnLostFocus:true` was on, so every case ran
@@ -447,17 +450,24 @@ class Probe:
                 "cases": [r.__dict__ for r in results]}
 
 
+# Which probe answers "is the world on screen" for each edition.
+IN_WORLD = {
+    "java": lambda screens: screens.in_world,
+    "bedrock": lambda screens: screens.bedrock_in_world,
+}
+
+
 class LiveIO:
     """The real thing: GameLens over HTTP with the agent token, PostMessageW."""
 
-    def __init__(self, url: str, token: str, out: Path) -> None:
+    def __init__(self, url: str, token: str, out: Path, game: str = "java") -> None:
         import play                               # the repo's HTTP helper
         import win32api
         import win32gui
-        from screens import in_world
+        import screens
 
         self._play, self._api, self._gui = play, win32api, win32gui
-        self._in_world = in_world
+        self._in_world = IN_WORLD[game](screens)
         self.url, self.token, self.out = url, token, out
         play.BASE = url
         state = self.state()
@@ -511,13 +521,15 @@ def main(argv=None) -> int:
     parser.add_argument("out", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:8777")
     parser.add_argument("--token-file", type=Path)
+    parser.add_argument("--game", choices=sorted(IN_WORLD), default="java")
     args = parser.parse_args(argv)
     import tempfile
 
     token_path = args.token_file or Path(tempfile.gettempdir()) / "ag.tok"
     token = token_path.read_text(encoding="utf-8").strip()
     args.out.mkdir(parents=True, exist_ok=True)
-    result = Probe(LiveIO(args.url, token, args.out)).run()
+    result = Probe(LiveIO(args.url, token, args.out, args.game)).run()
+    result["game"] = args.game
     result["ran_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     (args.out / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))

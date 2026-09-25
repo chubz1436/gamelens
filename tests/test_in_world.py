@@ -186,3 +186,82 @@ def test_a_bare_colour_reading_still_works():
     b = screens.slots(load("stack_1to2_after"))
     assert screens.picked_up(a.colors, b.colors) is False    # colour alone misses it
     assert screens.picked_up(a, None) is None
+
+
+# --- Bedrock ---------------------------------------------------------------------
+#
+# Frames from Bedrock 26.51 at two window sizes: "vm" is the Hyper-V test VM
+# (1280-wide frames), "host" the Owner's machine (1185-wide), blanked above 80%.
+
+
+@pytest.mark.parametrize("name", [
+    "bedrock_vm_world_empty_hotbar",
+    "bedrock_vm_world_item_selected",
+    "bedrock_vm_world_slot3_empty",
+    "bedrock_vm_world_toast",            # a tutorial toast is still the world
+    "bedrock_host_world_walk",
+    "bedrock_host_world_mining",
+    "bedrock_host_world_f5",             # third-person camera
+])
+def test_bedrock_world_is_recognised(name):
+    assert screens.bedrock_in_world(load(name)) is True
+
+
+@pytest.mark.parametrize("name", [
+    "bedrock_vm_pause",
+    "bedrock_vm_inventory_items",        # item slots are hollow squares too
+    "bedrock_vm_chat",                   # keys would go into the chat line
+    "bedrock_vm_trial_dialog",
+    "bedrock_vm_f1_hidden_hud",          # in the world, but unprovable: fails closed
+    "bedrock_vm_play_screen",
+    "bedrock_host_pause",
+    "bedrock_host_pause_fading",         # HUD visible but dimmed under the menu
+    "bedrock_host_inventory_fading",
+    "bedrock_host_inventory_items",
+])
+def test_bedrock_screens_that_are_not_the_world(name):
+    assert screens.bedrock_in_world(load(name)) is False
+
+
+def test_the_java_probe_misses_bedrock_at_the_vm_size():
+    """Why a second probe exists: the hotbar is where `in_world` does not look."""
+    assert screens.in_world(load("bedrock_vm_world_item_selected")) is False
+
+
+def test_bedrock_probe_on_nothing():
+    assert screens.bedrock_in_world(None) is False
+    assert screens.bedrock_in_world(np.zeros((0, 0, 3), np.uint8)) is False
+
+
+def _outline(img, x, y, side, colour=(235, 235, 235), t=3):
+    cv2.rectangle(img, (x, y), (x + side - 1, y + side - 1), colour, t)
+
+
+def test_bedrock_two_outlines_are_not_a_hotbar():
+    """Synthetic: no real screen has shown two, but a hotbar has one selection."""
+    img = np.zeros((674, 1280, 3), np.uint8)
+    _outline(img, 470, 633, 41)
+    assert screens.bedrock_in_world(img) is True
+    _outline(img, 700, 633, 41)
+    assert screens.bedrock_in_world(img) is False
+
+
+def test_bedrock_a_coloured_frame_is_not_the_selection():
+    """Synthetic: the selection is white-grey; a gold UI frame is something else."""
+    img = np.zeros((674, 1280, 3), np.uint8)
+    _outline(img, 470, 633, 41, colour=(40, 200, 240))
+    assert screens.bedrock_in_world(img) is False
+
+
+@pytest.mark.parametrize("what, draw", [
+    ("one thin slot border, like a lone inventory slot",
+     lambda img: _outline(img, 470, 633, 41, t=1)),
+    ("a filled light button",
+     lambda img: cv2.rectangle(img, (470, 633), (510, 673), (235, 235, 235), -1)),
+    ("a selection-like box that does not reach the bottom edge",
+     lambda img: _outline(img, 470, 575, 41)),
+])
+def test_bedrock_shapes_that_are_not_the_selection(what, draw):
+    img = np.zeros((674, 1280, 3), np.uint8)
+    draw(img)
+    assert screens.bedrock_in_world(img) is False, what
