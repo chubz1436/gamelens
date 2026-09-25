@@ -318,3 +318,32 @@ def test_the_poller_feeds_the_map_with_the_frame_session(lens):  # noqa: F811
     lens._stop.set()
     t.join(1.0)
     assert lens.activity._source is not None and lens.activity._source[0] == 5
+
+
+# --- Codex round 2 -------------------------------------------------------------------
+
+
+def test_something_that_has_just_stopped_is_not_moving():
+    """GL042-RV02-I01: animating for most of the window, then a still menu for
+    the last half second. Three old buckets must not mask it."""
+    amap = ActivityMap()
+    frames = [with_band(scene(), i) for i in range(33)] + [scene()] * 12
+    now = feed_run(amap, frames)
+    assert not amap.snapshot(now=now).any()
+
+
+def test_a_map_from_another_native_size_is_not_used():
+    """GL042-RV02-I02: the encoder can hand out the first frame of a new size
+    before the poller has fed it."""
+    amap = ActivityMap()
+    now = feed_run(amap, [with_band(scene(), i) for i in range(RUN)])
+    assert amap.snapshot(size=(H, W), now=now).any()
+    assert amap.snapshot(size=(H + 4, W + 4), now=now) is None
+
+
+def test_encode_frame_gets_no_map_for_a_frame_of_another_size(lens):  # noqa: F811
+    _animate(lens)
+    big = cv2.resize(with_band(scene(), 0), (W + 4, H + 4))
+    lens.capture.frames.frame = type(lens.capture.frames.frame)(300, big, 1)
+    token = shown(lens)
+    assert lens.observations.record(token)[3] is None

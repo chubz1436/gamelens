@@ -96,6 +96,9 @@ PROMOTE_MAX = 160.0
 # many unfinished, no new backend is started until they return (GL041-I03).
 MAX_PENDING_TEARDOWNS = 3
 
+# How long stop() waits for the last backend's teardown before giving up on it.
+STOP_TEARDOWN_WAIT = 2.0
+
 
 # --- buffer pool ----------------------------------------------------------
 
@@ -993,8 +996,12 @@ class CaptureSupervisor:
             backend, self._backend = self._backend, None
         if backend:
             backend.retire()
-            backend.stop()
         self.frames.clear()
+        if backend:
+            # A native stop can hang (WGC's has); shutdown must still get past
+            # it to the rest of the teardown (GL041-RV02-I02).
+            self._reap(backend)
+            self._teardowns[-1].join(timeout=STOP_TEARDOWN_WAIT)
 
     def stats(self) -> dict:
         backend = self.backend

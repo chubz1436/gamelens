@@ -49,7 +49,8 @@ ACTIVITY_TILE = 16
 
 # How far back "already moving" looks, in seconds, and how it is divided. A tile
 # is moving when it moved in at least ACTIVITY_NEED of ACTIVITY_BUCKETS equal
-# parts of the window -- persistent motion, not one burst.
+# parts of the window -- persistent motion, not one burst -- one of them the
+# latest: something that has just stopped is not moving (GL042-RV02-I01).
 ACTIVITY_WINDOW = 2.0
 ACTIVITY_BUCKETS = 4
 ACTIVITY_NEED = 3
@@ -107,17 +108,23 @@ class ActivityMap:
                 self._samples.popleft()
 
     def snapshot(self, until_frame_id: int | None = None, session_id: int | None = None,
+                 size: tuple[int, int] | None = None,
                  now: float | None = None) -> np.ndarray | None:
         """Tiles moving throughout the window, dilated; None with no usable history.
 
-        Only samples up to ``until_frame_id`` (the frame being handed out) and
-        from ``session_id`` count. None means "nothing known to be moving" and
-        is treated as all still, which is the strict direction.
+        Only samples up to ``until_frame_id`` (the frame being handed out),
+        from ``session_id`` and at native ``size`` (h, w) count: the encoder can
+        run ahead of the poller across a resize (GL042-RV02-I02). None means
+        "nothing known to be moving" and is treated as all still, which is the
+        strict direction.
         """
         now = time.monotonic() if now is None else now
         with self._lock:
-            if session_id is not None and (self._source is None
-                                           or self._source[0] != session_id):
+            if self._source is None:
+                return None
+            if session_id is not None and self._source[0] != session_id:
+                return None
+            if size is not None and tuple(self._source[1:]) != tuple(size):
                 return None
             kept = [(t, s) for t, fid, s in self._samples
                     if now - t <= self.window
@@ -127,6 +134,7 @@ class ActivityMap:
         end = kept[-1][0]
         span = self.window / self.buckets
         count = np.zeros(kept[0][1].shape[:2], np.int16)
+        latest = np.zeros(kept[0][1].shape[:2], bool)
         for i in range(self.buckets):
             lo, hi = end - self.window + i * span, end - self.window + (i + 1) * span
             part = [s for t, s in kept if lo <= t <= hi]
@@ -136,7 +144,9 @@ class ActivityMap:
             for a, b in zip(part, part[1:]):
                 moved |= np.abs(b - a).max(axis=2) > self.threshold
             count += moved
-        moving = count >= self.need
+            if i == self.buckets - 1:
+                latest = moved
+        moving = (count >= self.need) & latest
         if self.dilate:
             k = 2 * self.dilate + 1
             moving = cv2.dilate(moving.astype(np.uint8), np.ones((k, k), np.uint8)) > 0

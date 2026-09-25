@@ -292,3 +292,20 @@ def test_hung_teardowns_stop_new_starts_until_they_return(world):
     finally:
         world.hang.set()
         sup.stop()
+
+
+def test_stop_gets_past_a_hung_teardown(world):
+    """GL041-RV02-I02: a native stop that never returns must not hold shutdown."""
+    import threading
+
+    sup = supervisor()
+    world.hang = threading.Event()
+    try:
+        t0 = time.monotonic()
+        sup.stop()
+        took = time.monotonic() - t0
+        assert took < capture.STOP_TEARDOWN_WAIT + 1.5
+        assert sup.backend is None
+        assert sup.frames.acquire(timeout=0) is None
+    finally:
+        world.hang.set()

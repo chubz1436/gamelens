@@ -352,3 +352,19 @@ def test_no_backend_in_service_shows_nothing(lens):
 
     lens.capture.backend = None
     assert GameLens.encode_frame(lens, 50) is NO_FRAME
+
+
+def test_a_backend_dropped_during_the_encode_is_not_shown(lens, monkeypatch):
+    """GL041-RV02-I01: checked again after the encode, not only before it."""
+    from gamelens import app as app_module
+    from gamelens.server import NO_FRAME
+
+    real = app_module.encode_jpeg
+
+    def encode_and_drop(*a, **kw):
+        out = real(*a, **kw)
+        lens.capture.backend.retired = True          # the supervisor dropped it meanwhile
+        return out
+
+    monkeypatch.setattr(app_module, "encode_jpeg", encode_and_drop)
+    assert GameLens.encode_frame(lens, 50) is NO_FRAME

@@ -562,3 +562,25 @@ def test_a_missing_mid_interval_control_makes_the_trial_inconclusive():
 def test_bedrock_waits_long_enough_for_its_menus():
     assert probe.AFTER_FRAMES_BY_GAME["java"] == probe.AFTER_FRAMES
     assert probe.AFTER_FRAMES_BY_GAME["bedrock"] >= 13      # measured fade-out
+
+
+def test_focus_taken_during_the_second_frame_is_not_unsupported():
+    """GL043-RV02-I01: the second-frame rule re-runs the postconditions."""
+    io = FakeIO()
+    real_frame = io.frame
+    seen = {"e": False, "after_e": 0}
+
+    def react(io, msg, wp):
+        if msg == probe.WM_KEYDOWN and wp == probe.VK_E:
+            seen["e"] = True
+
+    def frame(after=None):
+        if seen["e"] and after is not None:
+            seen["after_e"] += 1
+            if seen["after_e"] == 2:             # the second, confirming frame
+                io.fg = True
+        return real_frame(after)
+
+    io.react, io.frame = react, frame
+    (e,) = [c for c in run(io, trials=1)["cases"] if c["name"] == "e_inventory"]
+    assert e["verdict"] != "unsupported"

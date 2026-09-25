@@ -374,6 +374,11 @@ class Probe:
             # A strong claim from one frame, so a second, later frame has to
             # agree -- a menu still on its way reads as the world (GL043-I01).
             again = self._frame_after_now()
+            problem = self._postcheck()
+            if problem:
+                self.poisoned = f"{name}: {problem}"
+                result.reason = problem
+                return result
             if again is None or not self.io.in_world(again):
                 self.poisoned = f"{name}: the screen was not steady after the input"
                 result.reason = ("the world showed after the input and then did not; a "

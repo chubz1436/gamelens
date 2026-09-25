@@ -413,7 +413,12 @@ class GameLens:
             observation = self.arbiter.observation_for(frame, scale=scale)
             token = self.observations.issue(observation, jpeg=jpeg, quality=quality,
                                             moving=self.activity.snapshot(
-                                                frame.frame_id, frame.session_id))
+                                                frame.frame_id, frame.session_id,
+                                                (frame.height, frame.width)))
+            # Again after the encode: the backend can be dropped while it runs,
+            # and a frame of a dropped capture is not to be shown (GL041-RV02-I01).
+            if not self._from_live_backend(frame):
+                return NO_FRAME
             return Encoded(jpeg, token, frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
