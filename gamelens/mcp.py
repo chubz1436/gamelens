@@ -99,14 +99,21 @@ TOOLS = [
             "is bound to the last image you were shown; if that has aged out, GameLens "
             "carries it to the newest frame only when nothing but time has changed (and "
             "for a click, only when the screen at the click point is unchanged). If it "
-            "refuses, you get the current image instead: decide again on it."),
+            "refuses, you get the current image instead: decide again on it. An outcome "
+            "of \"sent\" means the input was delivered. The picture after it is taken "
+            "after_frames later, and a menu opening or closing can take longer than that "
+            "to draw (Minecraft Bedrock: about 4 frames to pause, 13 to resume, at 32 fps) "
+            "-- if nothing seems to have changed, call gamelens_see before repeating it."),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": ACTION_SCHEMA,
                 "see_after": {"type": "boolean", "default": True},
                 "after_frames": {"type": "integer", "minimum": 1, "maximum": 30,
-                                 "default": 3},
+                                 "default": 3,
+                                 "description": "How many new frames to wait for before the "
+                                                "picture after the action. 3 shows a camera "
+                                                "turn; a menu transition may need 15."},
                 "quality": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
                 "strict": {"type": "boolean", "default": False,
                            "description": "Never rebind: act on the shown image or not at all."},
