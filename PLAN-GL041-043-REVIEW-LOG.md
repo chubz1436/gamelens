@@ -40,8 +40,27 @@ GL041-I01, GL041-I03, GL040-RV02-I01 confirmed closed. Five findings, all accept
 
 Fixed in bc50d20. 548 tests in the guest; 5/5 mutants killed.
 
+## Inspection 3 — REVISE (on bc50d20, 80d5fc2, 4ca6147, a05d0f0, 7f77420)
+
+The Owner asked for everything to be finished (2026-09-26), so a third round was run past the
+original budget of two. GL042-RV02-I02, GL041-RV02-I01/I02 and GL043-RV02-I01 confirmed closed;
+DLL pinning and the job object's pywin32 usage had no findings. Five findings, all accepted:
+
+- **RV03-I01 (high)** The activity window ended at the last sample; a sampling stall carried old
+  motion onto a newer frame. → the window ends at the moment of asking.
+- **RV03-I02 (high)** A failed windows-capture import was cached as "legacy, bind by title"; a later
+  2.x would be asked by title, a substring match. → unknown is its own answer, uncached, WGC refuses.
+- **RV03-I03 (medium)** An untied PrintWindow worker ran anyway, and one killed before assignment
+  orphaned. → startup fails when the tie fails; the worker exits once its parent is gone.
+- **RV03-I04 (high)** The hotbar search accepted two bright strokes. → it needs the top edge too.
+- **RV03-I05 (medium)** A bright frame was quadratic in columns. → vectorised per gap; frames over
+  1280 wide shrunk first; a white 4K frame refused in 0.3 s.
+
+Fixed in b23fec4. 580 tests in the guest; all mutants killed (8 detector, 5 others; two
+survivors were answered by simplifying: an equivalent `now=` argument dropped, a test sharpened).
+
 ## Status
 
-Inspection budget reached. The inspection-2 fixes have **not** been independently inspected.
-Known margin, measured live: on Bedrock's Play screen a late click on an opaque button at +4 s
-scored global 1.67 over the still tiles against a limit of 2.0 (records expire at 5 s).
+Three rounds. The round-3 fixes have not been independently inspected. Known margin, measured
+live: on Bedrock's Play screen a late click on an opaque button at +4 s scored global 1.67 over
+the still tiles against a limit of 2.0 (records expire at 5 s).
