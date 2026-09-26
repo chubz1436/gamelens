@@ -186,3 +186,159 @@ def test_a_bare_colour_reading_still_works():
     b = screens.slots(load("stack_1to2_after"))
     assert screens.picked_up(a.colors, b.colors) is False    # colour alone misses it
     assert screens.picked_up(a, None) is None
+
+
+# --- Bedrock ---------------------------------------------------------------------
+#
+# Frames from Bedrock 26.51 at two window sizes: "vm" is the Hyper-V test VM
+# (1280-wide frames), "host" the Owner's machine (1185-wide), blanked above 80%.
+
+
+@pytest.mark.parametrize("name", [
+    "bedrock_vm_world_empty_hotbar",
+    "bedrock_vm_world_item_selected",
+    "bedrock_vm_world_slot3_empty",
+    "bedrock_vm_world_toast",            # a tutorial toast is still the world
+    "bedrock_host_world_walk",
+    "bedrock_host_world_mining",
+    "bedrock_host_world_f5",             # third-person camera
+])
+def test_bedrock_world_is_recognised(name):
+    assert screens.bedrock_in_world(load(name)) is True
+
+
+@pytest.mark.parametrize("name", [
+    "bedrock_vm_pause",
+    "bedrock_vm_inventory_items",        # item slots are hollow squares too
+    "bedrock_vm_chat",                   # keys would go into the chat line
+    "bedrock_vm_trial_dialog",
+    "bedrock_vm_f1_hidden_hud",          # in the world, but unprovable: fails closed
+    "bedrock_vm_play_screen",
+    "bedrock_host_pause",
+    "bedrock_host_pause_fading",         # HUD visible but dimmed under the menu
+    "bedrock_host_inventory_fading",
+    "bedrock_host_inventory_items",
+])
+def test_bedrock_screens_that_are_not_the_world(name):
+    assert screens.bedrock_in_world(load(name)) is False
+
+
+def test_the_java_probe_is_still_wrong_for_bedrock():
+    """Why a second probe exists: Bedrock fades its menus in over a live HUD.
+
+    Since the hotbar search, `in_world` finds Bedrock's hotbar at any size too --
+    but it reads an inventory still fading in as the world.
+    """
+    assert screens.in_world(load("bedrock_host_inventory_fading")) is True
+    assert screens.bedrock_in_world(load("bedrock_host_inventory_fading")) is False
+
+
+# --- Java at other window sizes ------------------------------------------------
+#
+# Java 26.3 demo in the Hyper-V VM, maximized: 1024/1040 and 1280-wide frames
+# through PrintWindow ("pw", window rect with borders) and WGC. The fixed band
+# read False in the world on every one of them (2026-09-26).
+
+
+@pytest.mark.parametrize("name", [
+    "java_1280_world_pw",
+    "java_1280_world_wgc",
+    "java_1040_world_leaves",
+])
+def test_java_world_is_recognised_maximized(name):
+    assert screens.in_world(load(name)) is True
+
+
+@pytest.mark.parametrize("name", [
+    "java_1280_pause_pw",
+    "java_1280_pause_wgc",
+    "java_1280_inventory_pw",            # the hotbar row inside the inventory panel
+    "java_1280_inventory_wgc",
+    "java_1280_death_pw",                # HUD drawn, but dimmed under red
+    "java_1040_demo_dialog",
+    "java_1024_pause",
+])
+def test_java_screens_that_are_not_the_world_maximized(name):
+    assert screens.in_world(load(name)) is False
+
+
+def test_any_slot_is_seen_maximized():
+    """The search looks where the hotbar is -- centred -- not just where slot 1 is."""
+    mirrored = np.ascontiguousarray(load("java_1280_world_pw")[:, ::-1])   # slot 1 -> slot 9
+    assert screens.in_world(mirrored) is True
+
+
+def test_the_fixed_band_alone_misses_the_maximized_world():
+    """What the search is for: HOTBAR's fractions are wrong at this size."""
+    arr = load("java_1280_world_pw")
+    h, w = arr.shape[:2]
+    fx0, fy0, fx1, fy1 = screens.HOTBAR
+    band = arr[int(h * fy0):int(h * fy1), int(w * fx0):int(w * fx1), :3]
+    assert not screens._outline_in(screens._bright_cover(band), (fx1 - fx0) * w / 9.0)
+
+
+def test_bedrock_probe_on_nothing():
+    assert screens.bedrock_in_world(None) is False
+    assert screens.bedrock_in_world(np.zeros((0, 0, 3), np.uint8)) is False
+
+
+def _outline(img, x, y, side, colour=(235, 235, 235), t=3):
+    cv2.rectangle(img, (x, y), (x + side - 1, y + side - 1), colour, t)
+
+
+def test_bedrock_two_outlines_are_not_a_hotbar():
+    """Synthetic: no real screen has shown two, but a hotbar has one selection."""
+    img = np.zeros((674, 1280, 3), np.uint8)
+    _outline(img, 470, 633, 41)
+    assert screens.bedrock_in_world(img) is True
+    _outline(img, 700, 633, 41)
+    assert screens.bedrock_in_world(img) is False
+
+
+def test_bedrock_a_coloured_frame_is_not_the_selection():
+    """Synthetic: the selection is white-grey; a gold UI frame is something else."""
+    img = np.zeros((674, 1280, 3), np.uint8)
+    _outline(img, 470, 633, 41, colour=(40, 200, 240))
+    assert screens.bedrock_in_world(img) is False
+
+
+@pytest.mark.parametrize("what, draw", [
+    ("one thin slot border, like a lone inventory slot",
+     lambda img: _outline(img, 470, 633, 41, t=1)),
+    ("a filled light button",
+     lambda img: cv2.rectangle(img, (470, 633), (510, 673), (235, 235, 235), -1)),
+    ("a selection-like box that does not reach the bottom edge",
+     lambda img: _outline(img, 470, 575, 41)),
+])
+def test_bedrock_shapes_that_are_not_the_selection(what, draw):
+    img = np.zeros((674, 1280, 3), np.uint8)
+    draw(img)
+    assert screens.bedrock_in_world(img) is False, what
+
+
+def test_two_strokes_are_not_a_hotbar():
+    # RV03-I04 (Codex): two bright columns on a menu's footer passed the search.
+    arr = np.zeros((720, 1280, 3), np.uint8)
+    arr[711:720, 630] = 255
+    arr[711:720, 640] = 255
+    assert screens.in_world(arr) is False
+
+
+def test_a_closed_outline_at_an_uncalibrated_scale_is():
+    # The same strokes joined by a top edge, one slot pitch (33 px) wide, centred:
+    # what a selected slot looks like at a scale the fixed band was never fitted to.
+    arr = np.full((720, 1280, 3), 40, np.uint8)
+    x0, top = 640 - 4 * 33 - 20, 720 - 38
+    arr[top:720, x0:x0 + 3] = 255
+    arr[top:720, x0 + 37:x0 + 40] = 255
+    arr[top:top + 3, x0:x0 + 40] = 255
+    assert screens.in_world(arr) is True
+
+
+def test_a_bright_screen_is_refused_quickly():
+    # RV03-I05 (Codex): a white frame cost a Python-level check per column pair.
+    import time
+    arr = np.full((2160, 3840, 3), 255, np.uint8)
+    t = time.perf_counter()
+    assert screens.in_world(arr) is False
+    assert time.perf_counter() - t < 1.0

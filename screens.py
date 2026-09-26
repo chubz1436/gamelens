@@ -271,15 +271,150 @@ def in_world(arr):
     band = arr[y0:y1, left:min(w, x1 + pad), :3]
     if band.size == 0:
         return False
+    if _outline_in(_bright_cover(band), (x1 - x0) / 9.0):
+        return True
+    return _hotbar_anywhere(arr)
+
+
+def _bright(band):
     hsv = cv2.cvtColor(np.ascontiguousarray(band), cv2.COLOR_BGR2HSV)
-    bright = (hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)
-    cover = bright.mean(axis=0)
-    sides = np.flatnonzero(cover >= 0.5)
-    step = (x1 - x0) / 9.0
-    for a in sides:
-        for b in sides:
-            if 0.85 * step <= b - a <= 1.40 * step:
-                inside = cover[a + 3:b - 2]
-                if inside.size and inside.mean() < 0.4:
-                    return True
+    return (hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)
+
+
+def _bright_cover(band):
+    return _bright(band).mean(axis=0)
+
+
+def _outline_in(cover, step, top=None):
+    """Two bright sides about one slot apart with mostly dark columns between.
+
+    ``cover``: per column, the share of the band's rows that is bright. With
+    ``top`` (per column, bright anywhere just above the band) the pair must also
+    be joined by a top edge -- a closed box, not two strokes (RV03-I04).
+    Vectorised over positions for each allowed gap, so the work is bounded by
+    the band's width whatever the content: a bright screen used to cost a
+    Python-level check per pair of its columns (RV03-I05).
+    """
+    n = cover.size
+    side = cover >= 0.5
+    if np.count_nonzero(side) < 2:
+        return False
+    csum = np.concatenate(([0.0], np.cumsum(cover)))
+    tsum = None if top is None else np.concatenate(([0.0], np.cumsum(top)))
+    for gap in range(max(6, int(np.ceil(0.85 * step))), int(np.floor(1.40 * step)) + 1):
+        if gap >= n:
+            break
+        a = np.flatnonzero(side[:n - gap] & side[gap:])
+        if a.size == 0:
+            continue
+        ok = (csum[a + gap - 2] - csum[a + 3]) / (gap - 5) < 0.4
+        if tsum is not None:
+            ok &= (tsum[a + gap + 1] - tsum[a]) / (gap + 1) >= 0.7
+        if ok.any():
+            return True
     return False
+
+
+# Java sizes its HUD by an integer GUI scale chosen from the window size, so
+# HOTBAR's fractions hold only near the 870x519 window they were measured on.
+# Maximized in the test VM (1024-1280 wide frames) the fixed band read False in
+# the world on every frame (2026-09-26). What holds at every size: the hotbar is
+# centred and sits on the bottom of the client area, so only its scale is
+# unknown, and that is what gets searched.
+HOTBAR_PITCH_MIN = 8.0        # slot pitch in frame pixels (20 GUI px x scale)
+HOTBAR_SEARCH_WIDTH = 1280    # larger frames are shrunk first: bounds the work
+
+
+def _hotbar_anywhere(arr):
+    """The `in_world` outline test, at every hotbar scale.
+
+    Same side-and-interior test, same thresholds, applied to a centred band
+    9.1 pitches wide and 1.1 high on the bottom of the frame, for pitches from
+    8 px in half-pixel steps. A PrintWindow frame's 8 px window border below the
+    hotbar does not matter: the band still holds most of the outline's sides,
+    and searching border offsets changed no result. Checked against every Java frame on
+    record -- the calibrated 856/870 captures and maximized 1024, 1040 and 1280
+    wide ones through both WGC and PrintWindow: every world positive, no pause
+    menu, inventory, death screen, dialog, Options or crafting screen positive.
+    Unlike the fixed band it also demands the outline's top edge: a search over
+    scales gets many chances, and two bright strokes on a menu's footer must not
+    be enough (RV03-I04, Codex). The edge is looked for within a fifth of a
+    pitch of the band's top; that held on every real frame, PrintWindow's 8 px
+    border below the hotbar included.
+
+    Tens of ms at most, and only runs when the fixed band says no.
+    """
+    h, w = arr.shape[:2]
+    if w > HOTBAR_SEARCH_WIDTH:
+        k = HOTBAR_SEARCH_WIDTH / w
+        arr = cv2.resize(np.ascontiguousarray(arr[:, :, :3]),
+                         (HOTBAR_SEARCH_WIDTH, max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+        h, w = arr.shape[:2]
+    r0 = int(h * 0.75)
+    bright = _bright(arr[r0:, :, :3]).astype(np.int32)
+    rows = bright.shape[0]
+    cum = np.vstack([np.zeros((1, w), np.int32), np.cumsum(bright, axis=0)])
+    for pitch in np.arange(HOTBAR_PITCH_MIN, min(0.099 * w, rows / 1.1), 0.5):
+        height = int(round(1.1 * pitch))
+        pad = max(2, int(0.1 * pitch))
+        xa = max(0, int(w / 2 - 4.55 * pitch) - pad)
+        xb = min(w, int(w / 2 + 4.55 * pitch) + pad)
+        y0 = rows - height
+        t0 = max(0, int(y0 - 0.2 * pitch))
+        t1 = min(rows, int(y0 + 0.2 * pitch) + 1)
+        top = (cum[t1, xa:xb] - cum[t0, xa:xb]) > 0
+        if _outline_in((cum[rows, xa:xb] - cum[y0, xa:xb]) / height, pitch, top):
+            return True
+    return False
+
+
+# Bedrock scales its HUD with the window, so the hotbar is not at a fixed
+# fraction of the frame the way `in_world` assumes: at 1366x720 in the test VM
+# it sits lower and narrower than HOTBAR, and `in_world` answered False in the
+# world on every frame. What does hold across sizes is its shape.
+BEDROCK_BAND = 0.84           # search below this fraction of the height...
+BEDROCK_SPAN = (0.2, 0.8)     # ...and between these fractions of the width
+BEDROCK_SLOT = (0.025, 0.08)  # outline side, as a fraction of the width
+BEDROCK_FILL = (0.18, 0.45)   # bright share of the outline's bounding box
+
+
+def bedrock_in_world(arr):
+    """True when Bedrock's live world is on screen, not a menu drawn over it.
+
+    Same signal as `in_world` -- the selected hotbar slot's bright outline,
+    which Bedrock hides for the pause menu, inventory, chat, dialogs and with
+    F1, and dims while a menu fades in or out -- found by shape instead of by
+    position: exactly one hollow, square, bright, unsaturated outline touching
+    the bottom of the frame. The fill bounds are what separate it from the
+    inventory grid, whose slot borders are hollow squares too but thin (0.08 to
+    0.11 of their box against 0.25 to 0.33), and from anything filled in.
+
+    Calibrated on Bedrock 26.51 at two window sizes (1280 and 1185 wide frames):
+    world with and without an item selected, any slot, a tutorial toast, F5
+    camera -- positive; pause menu, inventory with items, chat, trial dialog,
+    F1, and pause or inventory still fading -- negative. The first frame of an
+    inventory fading in can still read positive; one frame later it does not.
+    """
+    if arr is None:
+        return False
+    h, w = arr.shape[:2]
+    y0 = int(h * BEDROCK_BAND)
+    x0, x1 = int(w * BEDROCK_SPAN[0]), int(w * BEDROCK_SPAN[1])
+    band = arr[y0:, x0:x1, :3]
+    if band.size == 0:
+        return False
+    hsv = cv2.cvtColor(np.ascontiguousarray(band), cv2.COLOR_BGR2HSV)
+    bright = ((hsv[:, :, 2] >= 170) & (hsv[:, :, 1] <= 60)).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
+    found = 0
+    for i in range(1, n):
+        x, y, bw, bh, area = stats[i]
+        if not (BEDROCK_SLOT[0] * w <= bw <= BEDROCK_SLOT[1] * w):
+            continue
+        if not 0.8 <= bw / max(bh, 1) <= 1.25:
+            continue
+        if y0 + y + bh < 0.95 * h:
+            continue
+        if BEDROCK_FILL[0] <= area / (bw * bh) <= BEDROCK_FILL[1]:
+            found += 1
+    return found == 1

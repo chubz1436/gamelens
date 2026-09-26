@@ -23,6 +23,8 @@ import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from gamelens.arbiter import _scroll_clicks, parse_sequence
+
 log = logging.getLogger(__name__)
 
 _STATIC = Path(__file__).parent / "static"
@@ -479,8 +481,38 @@ def create_app(runtime) -> FastAPI:
                     fn=runtime.submit_look,
                     dx=float(body["dx"]), dy=float(body["dy"]),
                 )
+            elif kind == "scroll":
+                horizontal = body.get("horizontal", False)
+                if not isinstance(horizontal, bool):
+                    raise ValueError("horizontal must be true or false")
+                call = dict(
+                    fn=runtime.submit_scroll,
+                    # Checked here so a bad count is a 400 before anything is
+                    # queued; scroll_action clamps what passes.
+                    clicks=_scroll_clicks(body.get("clicks")),
+                    horizontal=horizontal,
+                )
+            elif kind == "sequence":
+                # Parsed whole here, before anything is queued: every rule
+                # about what a sequence may contain raises ValueError, which is
+                # this request's 400 rather than a half-run sequence.
+                call = dict(
+                    fn=runtime.submit_sequence,
+                    steps=parse_sequence(body.get("steps"),
+                                         capacity=runtime.sequence_capacity()),
+                )
             else:
-                raise HTTPException(400, f"unknown kind {kind!r}; use click, press, key or look")
+                raise HTTPException(
+                    400,
+                    f"unknown kind {kind!r}; use click, press, key, look, scroll or sequence")
+            # Opt-in, and it has to be a real boolean: "false" is a truthy
+            # string, and a flag that loosens binding must not switch on by
+            # accident. See GameLens._bind.
+            rebind = body.get("rebind", False)
+            if not isinstance(rebind, bool):
+                raise ValueError("rebind must be true or false")
+            if rebind:
+                call["rebind"] = True
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError is in the list because JSON has no float limit: an
             # integer literal with four hundred zeros is valid JSON and a valid

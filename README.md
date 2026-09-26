@@ -126,11 +126,18 @@ These were open questions during the build. They are answered, not deferred.
 
 These are real and not worked around:
 
-- **WGC target identity is evidence, not proof.** `windows-capture` 1.4.2 binds by window
-  *title* and exposes no way to read back the HWND it bound. GameLens requires sole title
-  ownership before binding and re-verifies continuously, but ownership can still change in
-  the instant between the last check and the native bind. Use `--backend printwindow` when
-  you need HWND-exact capture.
+- **WGC target identity is evidence, not proof, on the pinned `windows-capture` 1.4.2.** It
+  binds by window *title* and exposes no way to read back the HWND it bound. GameLens requires
+  sole title ownership before binding and re-verifies continuously, but ownership can still
+  change in the instant between the last check and the native bind; and a game that retitles
+  its window (Java: "Minecraft 26.3" -> "Minecraft 26.3 - Singleplayer") loses WGC until
+  restart. Use `--backend printwindow` when you need HWND-exact capture. GameLens binds by
+  HWND automatically when the installed library offers `window_hwnd` (2.0+).
+- **Do not install `windows-capture` 2.0.1.** It has `window_hwnd` and delivers each frame once,
+  but it kills the whole process -- an access violation, no Python traceback -- when a WGC
+  session is restarted while the game is not presenting. Measured on the Hyper-V VM: 2 of 7
+  Java world reloads, first in `GraphicsCapture.dll` after it was unloaded, and, with that DLL
+  pinned, on the next reload inside `windows_capture.pyd` itself.
 - **Games using RawInput with `RIDEV_NOLEGACY`, or anti-cheat, may ignore `SendInput`.** It
   is a documented user-mode API and GameLens does not try to defeat anything. No kernel
   drivers, no evasion. Whether automating a given game is permitted is your call.
@@ -210,6 +217,116 @@ You never send a timestamp, a geometry version, or a scale factor — a caller c
 whether capture has stalled or a reflex has preempted since it got the picture, so it does not
 get to assert its own freshness. Coordinates are in the pixels of the image you received; the
 transport downscale is recorded server-side and applied for you.
+
+## Agent controls: MCP tools and sequences (GL-039)
+
+Any MCP client — Claude Code, Codex, another agent — can drive GameLens with three tools
+instead of hand-written HTTP calls:
+
+| tool | what it does |
+|---|---|
+| `gamelens_state` | armed / live / killed, capture backend and fps, target window |
+| `gamelens_see` | the newest frame, as an image |
+| `gamelens_act` | one action, then the frame after it — **one call is act + see** |
+
+The server is `python -m gamelens.mcp`, a stdio MCP server that is an HTTP client of a running
+GameLens. It holds **the agent token only**, read on every request from `GAMELENS_AGENT_TOKEN`
+or else the file `%TEMP%\ag.tok` (or `--token-file`), so restarting GameLens only means updating
+that file. It cannot arm, go live or stop: those stay the operator's, on the dashboard.
+
+Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gamelens]
+command = "B:/AI_Agent_folder/GAME VIDEO/.venv/Scripts/python.exe"
+args = ["-m", "gamelens.mcp"]
+cwd = "B:/AI_Agent_folder/GAME VIDEO"
+```
+
+**`kind: "sequence"`** puts overlapping steps in one action, so "walk while turning" is one
+call instead of a turn after the walk has already stopped:
+
+```json
+{"kind": "sequence", "steps": [
+  {"do": "key_down", "key": "w"},
+  {"do": "look", "dx": 200, "dy": 0}, {"do": "wait", "ms": 250},
+  {"do": "look", "dx": 200, "dy": 0}, {"do": "wait", "ms": 250}
+]}
+```
+
+Steps: `key_down`, `key_up`, `tap` (`ms`), `button_down`, `button_up`, `click` (`button`,
+optional `x`,`y`), `move` (`x`,`y`), `scroll` (`clicks`, `horizontal`), `look` (`dx`,`dy`),
+`wait` (`ms`). Everything pressed is released at the end. At most 64 steps and 5 s of waits,
+and no more new inputs than `--rate` allows at once. A sequence is judged for age at its first
+press; every later press still re-checks target, capture session, geometry, preemption and
+every safety interlock.
+
+### Any game, not only Minecraft (GL-040)
+
+Nothing in the controls knows which game is running. What a game is played with:
+
+| game style | how |
+|---|---|
+| first/third person (camera follows the mouse) | `look` to turn, `press` to fire/use where the crosshair is, keys to move |
+| visible cursor (strategy, RPG menus, card, point-and-click) | `click` at image pixels; `move` to hover; drag and modifier-clicks as a sequence |
+| weapon/hotbar wheel, zoom, list scroll | `kind: "scroll"` or a `scroll` step; negative is down |
+
+```json
+{"kind": "sequence", "steps": [
+  {"do": "move", "x": 210, "y": 340}, {"do": "button_down"},
+  {"do": "move", "x": 520, "y": 340}, {"do": "button_up"}
+]}
+```
+
+is a drag (box-select, move an item); `[{"do":"key_down","key":"shift"},{"do":"click","x":210,"y":340}]`
+is a shift-click. Every `move`/`click` point goes through the same bounds and geometry checks
+as a click, and one point outside the window refuses the whole sequence before any of it runs.
+With `rebind`, **every** point must still look as it was shown -- a drag whose drop point
+changed is refused even if the grab point did not.
+
+**Keys** (single `key` action): `a`-`z`, `0`-`9`, `f1`-`f11`, `space`, `enter`, `tab`,
+`escape`, `backspace`, `shift`/`ctrl`/`alt` and `rshift`/`rctrl`/`ralt`, arrows, `insert`,
+`delete`, `home`, `end`, `pageup`, `pagedown`, `numpad0`-`numpad9`, `multiply`, `add`,
+`subtract`, `decimal`, `divide`, and punctuation by name (`minus equals lbracket rbracket
+backslash semicolon quote comma period slash backtick`) or by character. Never: the Windows
+and menu keys, F12 and Pause (the kill switch), PrintScreen and the lock keys. In a
+**sequence**, all of these except `alt`, `ralt` and `escape` -- those are what Alt+Tab, Alt+F4
+and Ctrl+Esc need, and a chord the shell acts on cannot be undone by a later denial.
+**Buttons:** `left`, `right`, `middle`, `x1`/`mouse4`, `x2`/`mouse5`.
+
+**Checked at every press** (GL-040 inspection), on top of the interlocks:
+- a button press or a wheel notch needs the real cursor over the game window -- a `look` in a
+  windowed game can carry an unlocked cursor off the edge (`POINTER_OFF_TARGET`);
+- a key press is refused while either Alt or Windows key is held by anyone but GameLens, and
+  escape also while Ctrl is (`FOREIGN_MODIFIER`) -- your Alt plus an agent's F4 is Alt+F4;
+- a release that Windows rejected stops the action and blocks all new input until a retry
+  releases it (`UNRELEASED_INPUT`).
+
+Not closed: shift tapped five times is Windows's Sticky Keys prompt, if the Owner has it
+enabled; it takes the foreground, so the interlock stops the input that follows. A modifier
+pressed on the physical keyboard in the microseconds between the check and the press is not
+seen. A `look` while a button is held can move an unlocked cursor off the window mid-drag;
+the release is never withheld, and goes to the window that captured the mouse (normally the
+game). Through MCP, an `/act` whose answer is lost is reported as possibly carried out -- never
+retried.
+
+**Rebinding.** A model's turn is longer than the 0.8 s an observation lives, so an agent
+nearly always acts on an expired frame. `gamelens_act` sends `"rebind": true`, and the server
+carries the action to the newest frame **only if nothing but time changed**: same target,
+capture session, geometry, size and preemption counter, compared between the two records.
+For a click, the 33x33 pixels around the click point must also still match the image the
+agent was shown, in colour (and the whole image roughly), or it answers `SCREEN_CHANGED`
+and the agent gets the current image to decide on again. It never retries. Residual risk,
+stated: a small change *away from* the click point that changes what the click means is not
+seen. `strict: true` turns rebinding off for a call.
+
+**Not using your mouse and keyboard.** Everything above still injects with `SendInput`, which
+is global, and still needs the game in the foreground. Whether a game accepts input posted to
+its window while unfocused is per game. Minecraft Bedrock (2026-09-24): posted keys work,
+posted mouse clicks do not, and it pauses on focus loss and grabs the cursor when resumed --
+so on a shared desktop it fights the Owner either way. The durable answer is a separate
+machine or VM (`tools/vm/new-test-vm.ps1`). `tools/bg_input_probe.py` is a Minecraft
+Java-only experiment on the same question.
 
 ## Provenance
 

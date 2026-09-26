@@ -47,7 +47,11 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_XDOWN = 0x0080
+MOUSEEVENTF_XUP = 0x0100
 MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x01000
+WHEEL_DELTA = 120
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 
@@ -118,6 +122,13 @@ _user32.SendInput.restype = wt.UINT
 
 _user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 _user32.GetCursorPos.restype = wt.BOOL
+_user32.WindowFromPoint.argtypes = [wt.POINT]
+_user32.WindowFromPoint.restype = wt.HWND
+_user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+_user32.GetAncestor.restype = wt.HWND
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = ctypes.c_short
+GA_ROOT = 2
 
 
 class InjectionFailed(RuntimeError):
@@ -188,6 +199,37 @@ def cursor_position() -> tuple[int, int] | None:
     return int(pt.x), int(pt.y)
 
 
+def pointer_on_window(hwnd: int) -> bool:
+    """Is the cursor over ``hwnd`` (or one of its children) right now?
+
+    A press or a wheel notch with no coordinate of its own lands wherever the
+    cursor is. In a game that locks the cursor that is the game; in a windowed
+    one a relative `look` can walk it off the edge, and the foreground check
+    still passes until the click has already landed on whatever is there
+    (GL040-I01). Unreadable counts as no.
+    """
+    here = cursor_position()
+    if here is None:
+        return False
+    child = _user32.WindowFromPoint(wt.POINT(*here))
+    root = _user32.GetAncestor(child, GA_ROOT) if child else None
+    return bool(root) and int(root) == int(hwnd)
+
+
+# Keys that turn a game key into a shell chord: either Alt (Alt+F4, Alt+Tab)
+# and either Windows key. Ctrl too, but only in front of escape (Ctrl+Esc,
+# Ctrl+Shift+Esc). Checked by physical state, because the Owner holding one
+# is as good as GameLens pressing it (GL040-I03).
+CHORD_MODIFIERS = (0xA4, 0xA5, 0x5B, 0x5C)          # LAlt RAlt LWin RWin
+ESCAPE_MODIFIERS = (0xA2, 0xA3)                     # LCtrl RCtrl
+VK_ESCAPE = 0x1B
+
+
+def held_keys(vks) -> set[int]:
+    """Which of ``vks`` are down right now, by the async (physical+injected) state."""
+    return {vk for vk in vks if _user32.GetAsyncKeyState(vk) & 0x8000}
+
+
 def move_events(x: int, y: int, desktop: VirtualDesktop | None = None) -> list[INPUT]:
     """Absolute move to (x, y) that is guaranteed to reach the target as an event.
 
@@ -245,22 +287,67 @@ def _key_event(vk: int, up: bool) -> INPUT:
 
 
 class Button(Enum):
-    LEFT = (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
-    RIGHT = (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
-    MIDDLE = (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)
+    """(down flags, up flags, mouseData). The side buttons share their flags and
+    differ only in mouseData, which is also what keeps the two values distinct."""
+
+    LEFT = (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0)
+    RIGHT = (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0)
+    MIDDLE = (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0)
+    X1 = (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, 1)      # "mouse 4", back
+    X2 = (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, 2)      # "mouse 5", forward
+
+    def event(self, up: bool) -> INPUT:
+        return _mouse_event(self.value[1] if up else self.value[0], data=self.value[2])
+
+
+# Every name a caller may use for a mouse button. A typo is refused, never read
+# as a left click.
+BUTTON_NAMES: dict[str, Button] = {
+    "left": Button.LEFT, "right": Button.RIGHT, "middle": Button.MIDDLE,
+    "x1": Button.X1, "mouse4": Button.X1, "x2": Button.X2, "mouse5": Button.X2,
+}
+
+
+def button_from_name(name) -> Button:
+    """Resolve a caller's button name, or raise ValueError."""
+    button = BUTTON_NAMES.get(str(name).strip().lower())
+    if button is None:
+        raise ValueError(
+            f"unknown button {name!r}; use {', '.join(BUTTON_NAMES)}")
+    return button
 
 
 # Names a caller may use instead of a virtual-key code. An allowlist, not a
 # convenience: a caller that can name any VK can send Alt+F4, Ctrl+Alt+Del's
 # reachable parts, or the Windows key, none of which are "input to the game".
 # Anything outside this table is refused rather than translated.
+#
+# Wide enough for any game's default bindings, not only Minecraft's: every
+# F-key a game binds, the punctuation row, the navigation block and the numpad.
+# Still out: the Windows and menu keys (the shell's, not the game's), F12 and
+# Pause (GameLens's own kill switch -- an agent must not be able to press it,
+# or to be the reason it looks pressed), PrintScreen, and the lock keys, which
+# change the Owner's keyboard state after GameLens has gone.
 KEY_NAMES: dict[str, int] = {
     **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
     **{str(d): ord(str(d)) for d in range(10)},
+    **{f"f{n}": 0x6F + n for n in range(1, 12)},                 # F1..F11
+    **{f"numpad{d}": 0x60 + d for d in range(10)},
+    "multiply": 0x6A, "add": 0x6B, "subtract": 0x6D, "decimal": 0x6E, "divide": 0x6F,
     "space": 0x20, "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
+    "backspace": 0x08,
     "shift": 0xA0, "ctrl": 0xA2, "alt": 0xA4,
+    "rshift": 0xA1, "rctrl": 0xA3, "ralt": 0xA5,
     "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
-    "f1": 0x70, "f3": 0x72, "f5": 0x74,
+    "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "pagedown": 0x22,
+    # US-layout names for the punctuation keys; the key is the physical one,
+    # whatever it prints on another layout.
+    "minus": 0xBD, "equals": 0xBB, "lbracket": 0xDB, "rbracket": 0xDD,
+    "backslash": 0xDC, "semicolon": 0xBA, "quote": 0xDE, "comma": 0xBC,
+    "period": 0xBE, "slash": 0xBF, "backtick": 0xC0,
+    "-": 0xBD, "=": 0xBB, "[": 0xDB, "]": 0xDD, "\\": 0xDC, ";": 0xBA,
+    "'": 0xDE, ",": 0xBC, ".": 0xBE, "/": 0xBF, "`": 0xC0,
 }
 
 
@@ -322,16 +409,28 @@ class LookBy:
 
 
 @dataclass(frozen=True)
+class Scroll:
+    """Turn the wheel by whole notches. Negative ``clicks`` is down (or left).
+
+    Wheel input is relative and has no position of its own: it goes wherever
+    the cursor already is, which in a pointer-locked game is the crosshair.
+    """
+
+    clicks: int
+    horizontal: bool = False
+
+
+@dataclass(frozen=True)
 class Dwell:
     seconds: float
 
 
-Step = MoveTo | LookBy | ButtonDown | ButtonUp | KeyDown | KeyUp | Dwell
+Step = MoveTo | LookBy | Scroll | ButtonDown | ButtonUp | KeyDown | KeyUp | Dwell
 
 # Steps that introduce *new* input. Every one of these is authorized inside the
 # dispatch boundary -- movement included, because a live cursor jump is itself an
 # intrusion on whatever the operator is doing.
-_NEW_INPUT_STEPS = (MoveTo, LookBy, ButtonDown, KeyDown)
+_NEW_INPUT_STEPS = (MoveTo, LookBy, Scroll, ButtonDown, KeyDown)
 
 # Steps that undo input we are already holding. These must be able to proceed
 # when the guard is denying everything, or a killed session leaves keys down.
@@ -505,7 +604,7 @@ class InputExecutor:
             if what not in tracked:
                 return True          # someone else released it; nothing owed
 
-        event = (_mouse_event(what.value[1]) if kind == "button"
+        event = (what.event(up=True) if kind == "button"
                  else _key_event(what, up=True))
         label = f"{kind}:{what.name if kind == 'button' else what}"
         try:
@@ -551,10 +650,14 @@ class InputExecutor:
             if self._safety.dry_run:
                 log.info("[dry-run] %s %s", label, step)
                 return
-            if isinstance(step, ButtonUp):
-                self._release_one("button", step.button)
-            else:
-                self._release_one("key", step.vk)
+            ok = (self._release_one("button", step.button) if isinstance(step, ButtonUp)
+                  else self._release_one("key", step.vk))
+        if not ok:
+            # Carrying on would report "sent" with the key still down, and the
+            # next action would press on top of it -- a stuck alt followed by
+            # an F4 is Alt+F4 (GL040-I02). Raising sends the sequence to the
+            # executor's error path, which releases everything and reports it.
+            raise InjectionFailed(f"release of {step} failed; it may still be held")
 
     # --- execution ------------------------------------------------------
 
@@ -621,6 +724,10 @@ class InputExecutor:
         the operator's.
         """
         injected = False
+        if self.unreleased:
+            # One more attempt before refusing: the failure may have been
+            # transient. Outside every boundary, as release_all requires.
+            self.release_all("retrying a failed release before new input")
         for step in seq.steps:
             if self._cancel.is_set():
                 raise NotPermitted(Denial.KILLED, "cancelled mid-sequence")
@@ -652,10 +759,32 @@ class InputExecutor:
                 if self._safety.dry_run:
                     log.info("[dry-run] %s %s", seq.label, step)
                 else:
+                    self._guard_input(step)
                     self._apply_new(step)
                     injected = True
 
         return "sent" if injected else "dry"
+
+    def _guard_input(self, step: Step) -> None:
+        """The checks that depend on the input itself, at the moment it is sent.
+
+        Inside the commit boundary, after every interlock, immediately before
+        the event. Raises NotPermitted, which the executor reports as denied
+        and follows with release_all.
+        """
+        if self.unreleased:
+            raise NotPermitted(Denial.UNRELEASED_INPUT, ", ".join(sorted(self.unreleased)))
+        if isinstance(step, KeyDown):
+            watch = CHORD_MODIFIERS + (ESCAPE_MODIFIERS if step.vk == VK_ESCAPE else ())
+            with self._lock:
+                ours = set(self._pressed_keys)
+            foreign = held_keys(watch) - ours
+            if foreign:
+                raise NotPermitted(Denial.FOREIGN_MODIFIER,
+                                   "vk " + ", ".join(f"{vk:#04x}" for vk in sorted(foreign)))
+        elif isinstance(step, (ButtonDown, Scroll)):
+            if not pointer_on_window(self._safety.target_hwnd):
+                raise NotPermitted(Denial.POINTER_OFF_TARGET, str(cursor_position()))
 
     def _apply_new(self, step: Step) -> None:
         """Inject one new input. Tracking is recorded only after a confirmed send."""
@@ -665,8 +794,14 @@ class InputExecutor:
             # No ABSOLUTE flag: this is a delta, and it is the only kind of
             # mouse input a pointer-locked game will interpret as a turn.
             _send([_mouse_event(MOUSEEVENTF_MOVE, step.dx, step.dy)])
+        elif isinstance(step, Scroll):
+            # mouseData is a DWORD carrying a signed count; a negative one has
+            # to be handed over as its two's complement.
+            data = (step.clicks * WHEEL_DELTA) & 0xFFFFFFFF
+            flag = MOUSEEVENTF_HWHEEL if step.horizontal else MOUSEEVENTF_WHEEL
+            _send([_mouse_event(flag, data=data)])
         elif isinstance(step, ButtonDown):
-            _send([_mouse_event(step.button.value[0])])
+            _send([step.button.event(up=False)])
             with self._lock:
                 self._pressed_buttons.add(step.button)
         elif isinstance(step, KeyDown):

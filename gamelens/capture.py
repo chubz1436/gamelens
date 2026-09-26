@@ -52,6 +52,77 @@ WGC_BORDER_TOGGLE_SUPPORTED = (
     _sys.platform.startswith("win") and _sys.getwindowsversion().build >= 22000
 )
 
+_wgc_hwnd: bool | None = None
+
+
+def wgc_selects_by_hwnd() -> bool | None:
+    """Whether the installed windows-capture can bind a window by its HWND.
+
+    2.0 added ``window_hwnd`` (and turned ``window_name`` into a substring match,
+    so an HWND-capable library is never asked by title). 1.4.2, the pinned
+    version, binds by title only: 2.0.1 crashes on a session restart (README).
+    Decided once, from the signature.
+
+    None when the library cannot be imported or inspected: unknown is not
+    "legacy" (RV03-I02, Codex). Taken as legacy, a later successful import of
+    2.x would be asked by title -- a substring match -- and could bind
+    "Minecraft Launcher" for "Minecraft". Unknown is not cached, and WGC refuses
+    to start on it.
+    """
+    global _wgc_hwnd
+    if _wgc_hwnd is None:
+        try:
+            import inspect
+
+            from windows_capture import WindowsCapture
+            _wgc_hwnd = "window_hwnd" in inspect.signature(WindowsCapture).parameters
+        except Exception:
+            log.warning("cannot tell whether windows-capture binds by HWND", exc_info=True)
+            return None
+    return _wgc_hwnd
+
+
+_graphics_capture_pinned = False
+
+
+def pin_graphics_capture() -> bool:
+    """Keep GraphicsCapture.dll loaded for the life of the process.
+
+    Found on the Hyper-V VM with windows-capture 2.0.1: when a session ends and
+    no other WGC object is alive, COM may unload the DLL while the ending
+    session's callback thread is still running in it -- an access violation in
+    "GraphicsCapture.dll_unloaded" that kills the whole process, with no Python
+    traceback (2 of 7 Java world reloads, each of which starves WGC and forces a
+    restart). Pinning makes that unload impossible. It did not make 2.0.1 safe:
+    the next reload faulted inside windows_capture.pyd instead, which is why
+    1.4.2 stays pinned. Cheap, and it closes one way to die on any version.
+    Done once, before the first session; a failure is logged and capture
+    proceeds as before.
+    """
+    global _graphics_capture_pinned
+    if _graphics_capture_pinned or not _sys.platform.startswith("win"):
+        return _graphics_capture_pinned
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LoadLibraryW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleExW.argtypes = (
+            wintypes.DWORD, wintypes.LPCWSTR, ctypes.POINTER(wintypes.HMODULE))
+        if not kernel32.LoadLibraryW("GraphicsCapture.dll"):
+            raise ctypes.WinError(ctypes.get_last_error())
+        GET_MODULE_HANDLE_EX_FLAG_PIN = 0x1
+        module = wintypes.HMODULE()
+        if not kernel32.GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN, "GraphicsCapture.dll", ctypes.byref(module)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        _graphics_capture_pinned = True
+    except Exception:
+        log.warning("could not pin GraphicsCapture.dll; a WGC restart may crash the process",
+                    exc_info=True)
+    return _graphics_capture_pinned
+
 # Identity is verified on every published frame. An earlier revision throttled
 # the enumerating half to 4Hz on cost grounds, which was wrong twice over: the
 # per-frame remainder checked only IsWindow -- not even the title, contrary to
@@ -72,6 +143,32 @@ FRAME_DEADLINE = 0.5
 # this a backend whose very first call never returns stays "still starting up"
 # forever, and the supervisor that exists to replace it never fires.
 FIRST_FRAME_DEADLINE = 2.0
+
+# When every backend has failed, how long to wait before starting again from the
+# top of the order. A game that stops presenting for a moment -- Bedrock
+# generating a world draws nothing for seconds -- walks every backend past its
+# deadline in turn, and capture used to end there for good with the game
+# running normally a second later (GL-041). Growing, capped, never giving up.
+RETRY_BACKOFF = (1.0, 2.0, 5.0)
+
+# The transition history is for reading on the dashboard, and a retry loop now
+# appends to it for as long as the target stays dark.
+TRANSITIONS_KEPT = 64
+
+# How long a fallback backend must have been running before the supervisor
+# tries the top of the order again, and the ceiling that wait doubles up to
+# while the better backend keeps failing.
+PROMOTE_AFTER = 10.0
+PROMOTE_MAX = 160.0
+
+# Teardowns run on their own threads because a backend's stop can hang (WGC's
+# native stop has). Each drop starts one, and with retries a hung stop would
+# leave one more thread and native session behind every few seconds; past this
+# many unfinished, no new backend is started until they return (GL041-I03).
+MAX_PENDING_TEARDOWNS = 3
+
+# How long stop() waits for the last backend's teardown before giving up on it.
+STOP_TEARDOWN_WAIT = 2.0
 
 
 # --- buffer pool ----------------------------------------------------------
@@ -463,10 +560,11 @@ class CaptureBackend:
 class WgcBackend(CaptureBackend):
     """Windows Graphics Capture via windows-capture.
 
-    Binds by window *title* because 1.4.2 exposes no HWND selector and no way to
-    read back the HWND it bound. Identity is therefore evidence, not proof: we
-    require sole title ownership before binding and re-verify on every frame, and
-    any failure stops capture rather than degrading quietly.
+    Binds by HWND when the library can (2.0+), which makes it as exact as
+    PrintWindow. On 1.4.2 it binds by window *title*, with no way to read back the
+    HWND it bound; identity is then evidence, not proof: we require sole title
+    ownership before binding and re-verify on every frame, and any failure stops
+    capture rather than degrading quietly.
     """
 
     kind = Backend.WGC
@@ -476,9 +574,14 @@ class WgcBackend(CaptureBackend):
         self._control = None
         self._checked_first_frame = False
         self.border_suppressed = False
+        self.by_hwnd = wgc_selects_by_hwnd()
 
     def start(self) -> None:
-        self.binding.verify(require_title_ownership=True)
+        if self.by_hwnd is None:
+            raise RuntimeError("windows-capture is unavailable or could not be inspected; "
+                               "not binding WGC by title on a guess")
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
+        pin_graphics_capture()
         self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
         if not WGC_BORDER_TOGGLE_SUPPORTED:
             log.info(
@@ -493,11 +596,11 @@ class WgcBackend(CaptureBackend):
     def _open(self, *, draw_border: bool | None):
         from windows_capture import WindowsCapture
 
-        cap = WindowsCapture(
-            cursor_capture=False,
-            draw_border=draw_border,
-            window_name=self.binding.title,
-        )
+        if self.by_hwnd:
+            target = {"window_hwnd": self.binding.hwnd}
+        else:
+            target = {"window_name": self.binding.title}
+        cap = WindowsCapture(cursor_capture=False, draw_border=draw_border, **target)
 
         @cap.event
         def on_frame_arrived(frame, capture_control):  # noqa: ANN001
@@ -534,7 +637,7 @@ class WgcBackend(CaptureBackend):
                 )
             self._checked_first_frame = True
 
-        self.binding.verify(require_title_ownership=True)
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
         self._publish(array, getattr(frame, "timespan", 0) or 0)
 
     def stop(self) -> None:
@@ -602,6 +705,56 @@ class MssBackend(CaptureBackend):
         self._thread = None
 
 
+_kill_job = None
+_kill_job_lock = threading.Lock()
+
+
+def die_with_this_process(pid: int) -> bool:
+    """Tie child *pid* to this process: when GameLens exits, however it exits, so does the child.
+
+    ``daemon=True`` only covers a clean interpreter exit. Found on the Hyper-V VM:
+    GameLens killed hard (Stop-Process) left its PrintWindow worker running with
+    no parent, still holding the log file the next GameLens run needed. A job
+    object with KILL_ON_JOB_CLOSE is closed by the kernel when this process dies,
+    and that terminates every process in it -- including one blocked inside
+    PrintWindow, which could never notice its parent had gone. One job for the
+    process lifetime; its handle is deliberately never closed.
+
+    The child runs for a moment before it is assigned; a kill landing in that
+    moment is covered by the worker itself, which exits when it sees its parent
+    gone (``_pw_worker.run``).
+    """
+    global _kill_job
+    if not _sys.platform.startswith("win"):
+        return False
+    try:
+        import win32api
+        import win32con
+        import win32job
+
+        with _kill_job_lock:
+            if _kill_job is None:
+                job = win32job.CreateJobObject(None, "")
+                info = win32job.QueryInformationJobObject(
+                    job, win32job.JobObjectExtendedLimitInformation)
+                info["BasicLimitInformation"]["LimitFlags"] |= (
+                    win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+                win32job.SetInformationJobObject(
+                    job, win32job.JobObjectExtendedLimitInformation, info)
+                _kill_job = job
+            child = win32api.OpenProcess(
+                win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE, False, pid)
+            try:
+                win32job.AssignProcessToJobObject(_kill_job, child)
+            finally:
+                win32api.CloseHandle(child)
+        return True
+    except Exception:
+        log.warning("could not tie child %d to this process; it may outlive a hard kill",
+                    pid, exc_info=True)
+        return False
+
+
 class PrintWindowBackend(CaptureBackend):
     """PrintWindow, driven from a child process so it can be killed.
 
@@ -638,6 +791,11 @@ class PrintWindowBackend(CaptureBackend):
             daemon=True,
         )
         self._proc.start()
+        if not die_with_this_process(self._proc.pid):
+            # An unprotected worker can outlive a hard kill holding our files
+            # (RV03-I03, Codex): refuse this backend rather than run one.
+            self.stop()
+            raise RuntimeError("could not tie the printwindow worker to this process")
 
         self._reader = threading.Thread(
             target=self._read_loop, name="gamelens-pw-reader", daemon=True
@@ -795,7 +953,11 @@ class CaptureSupervisor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.transitions: list[str] = []
+        self.transitions: deque[str] = deque(maxlen=TRANSITIONS_KEPT)
+        self._retries = 0
+        self._retry_at: float | None = None
+        self._promote_wait = PROMOTE_AFTER
+        self._teardowns: list[threading.Thread] = []
 
     @property
     def backend(self) -> CaptureBackend | None:
@@ -812,14 +974,20 @@ class CaptureSupervisor:
     def _activate_from(self, index: int) -> None:
         """Bring up the first backend at or after *index* that starts cleanly."""
         last_error: Exception | None = None
+        self._teardowns = [t for t in self._teardowns if t.is_alive()]
+        if len(self._teardowns) >= MAX_PENDING_TEARDOWNS:
+            raise RuntimeError(f"{len(self._teardowns)} backend teardowns have not returned; "
+                               "not starting another capture on top of them")
         for i in range(index, len(self._order)):
+            if self._stop.is_set():
+                raise RuntimeError("capture is stopping")
             kind = self._order[i]
             cls = _BACKEND_CLASSES[kind]
 
-            if kind is Backend.WGC and not title_still_owned_by(
+            if kind is Backend.WGC and wgc_selects_by_hwnd() is not True and not title_still_owned_by(
                 self.binding.hwnd, self.binding.title
             ):
-                # Not an error: WGC binds by title, and the title is either
+                # Not an error: this WGC binds by title, and the title is either
                 # ambiguous or has moved to another window, so this backend
                 # simply is not usable for this target right now.
                 self.transitions.append(f"{kind.value}: skipped (title not solely owned)")
@@ -839,8 +1007,17 @@ class CaptureSupervisor:
                 continue
 
             with self._lock:
-                self._backend = backend
-                self._index = i
+                # Checked under the lock stop() reads the backend under
+                # (GL041-I01): a start that outlasts stop()'s join must not
+                # install a live, unsupervised backend after shutdown.
+                stopping = self._stop.is_set()
+                if not stopping:
+                    self._backend = backend
+                    self._index = i
+            if stopping:
+                backend.retire()
+                self._reap(backend)
+                raise RuntimeError("capture stopped while a backend was starting")
             self.transitions.append(f"{kind.value}: active (session {backend.session_id})")
             log.info("capture backend %s active (session %d)", kind.value, backend.session_id)
             return
@@ -850,50 +1027,113 @@ class CaptureSupervisor:
             + (f"; last error {last_error!r}" if last_error else "")
         )
 
+    def _schedule_retry(self, exc: Exception) -> None:
+        delay = RETRY_BACKOFF[min(self._retries, len(RETRY_BACKOFF) - 1)]
+        self._retries += 1
+        self._retry_at = time.monotonic() + delay
+        self.transitions.append(f"all backends failed; retrying in {delay:g}s")
+        log.error("failover exhausted: %s; retrying from the top in %gs", exc, delay)
+
+    def _retry(self) -> None:
+        self._retry_at = None
+        try:
+            self._activate_from(0)
+        except RuntimeError as exc:
+            self._schedule_retry(exc)
+            return
+        self._retries = 0
+
+    def _drop(self, backend: CaptureBackend) -> None:
+        """Take a backend out of service; nothing it does afterwards is seen."""
+        # Retire *before* stopping. From this moment its publications are
+        # fenced off, so a call that returns late -- after failover -- cannot
+        # overwrite the replacement backend's frames while its own teardown
+        # is still in progress.
+        backend.retire()
+        with self._lock:
+            if self._backend is backend:
+                # Stop advertising it immediately. Leaving _backend pointing
+                # at a retired object lets an observation taken against it
+                # keep passing the arbiter's session check during failover.
+                self._backend = None
+        self.frames.clear()
+        self._reap(backend)
+
+    def _reap(self, backend: CaptureBackend) -> None:
+        t = threading.Thread(target=backend.stop, name="gamelens-backend-teardown",
+                             daemon=True)
+        self._teardowns.append(t)
+        t.start()
+
+    def _promote(self, backend: CaptureBackend) -> None:
+        """Leave a fallback for the top of the order, if the top works again.
+
+        Failover only ever moves down, and the bottom is mss -- which captures
+        whatever is on screen over the window. A few seconds of a game not
+        presenting used to leave it there for the life of the process
+        (GL-041). The cost of trying is one gap no longer than the first-frame
+        deadline, during which nothing is published and every action is
+        refused as stale. Each try doubles the wait before the next; only a top
+        backend that then stays healthy for PROMOTE_AFTER earns it back, since
+        one that starts and dies straight away looks like success at start.
+        """
+        self._promote_wait = min(self._promote_wait * 2, PROMOTE_MAX)
+        self.transitions.append(f"{backend.kind.value}: stepping back up to "
+                                f"{self._order[0].value}")
+        log.info("backend %s has been up %.0fs; trying %s again",
+                 backend.kind.value, time.monotonic() - backend.activated_at,
+                 self._order[0].value)
+        self._drop(backend)
+        try:
+            self._activate_from(0)
+        except RuntimeError as exc:
+            self._schedule_retry(exc)
+
     def _supervise(self) -> None:
         while not self._stop.wait(0.05):
             backend = self.backend
-            if backend is None or backend.healthy(self.deadline):
+            if backend is None:
+                # Nothing is published while this lasts, so every observation
+                # fails the arbiter's freshness check: dark, not unsafe.
+                if self._retry_at is not None and time.monotonic() >= self._retry_at:
+                    self._retry()
+                continue
+            if backend.healthy(self.deadline):
+                up_for = time.monotonic() - backend.activated_at
+                if self._index > 0 and up_for >= self._promote_wait:
+                    self._promote(backend)
+                elif self._index == 0 and up_for >= PROMOTE_AFTER:
+                    self._promote_wait = PROMOTE_AFTER
                 continue
 
             reason = backend.error or f"no frame for >{self.deadline}s"
             self.transitions.append(f"{backend.kind.value}: unhealthy ({reason})")
             log.error("backend %s unhealthy: %s", backend.kind.value, reason)
+            self._drop(backend)
 
-            # Retire *before* stopping. From this moment its publications are
-            # fenced off, so a call that returns late -- after failover -- cannot
-            # overwrite the replacement backend's frames while its own teardown
-            # is still in progress.
-            backend.retire()
-            with self._lock:
-                if self._backend is backend:
-                    # Stop advertising it immediately. Leaving _backend pointing
-                    # at a retired object lets an observation taken against it
-                    # keep passing the arbiter's session check during failover.
-                    self._backend = None
-            self.frames.clear()
-            threading.Thread(
-                target=backend.stop, name="gamelens-backend-teardown", daemon=True
-            ).start()
-
-            if self._forced:
-                log.error("backend forced to %s; not failing over", self._forced.value)
-                return
+            # A forced order holds one backend, so this goes straight to the
+            # retry, which restarts that same backend: forced means "never a
+            # different one", not "never again".
             try:
                 self._activate_from(self._index + 1)
             except RuntimeError as exc:
-                log.error("failover exhausted: %s", exc)
-                return
+                self._schedule_retry(exc)
 
     def stop(self) -> None:
         self._stop.set()
         t = self._thread
         if t:
             t.join(timeout=1.0)
-        backend = self.backend
+        with self._lock:
+            backend, self._backend = self._backend, None
         if backend:
-            backend.stop()
+            backend.retire()
         self.frames.clear()
+        if backend:
+            # A native stop can hang (WGC's has); shutdown must still get past
+            # it to the rest of the teardown (GL041-RV02-I02).
+            self._reap(backend)
+            self._teardowns[-1].join(timeout=STOP_TEARDOWN_WAIT)
 
     def stats(self) -> dict:
         backend = self.backend
@@ -902,6 +1142,9 @@ class CaptureSupervisor:
             return {
                 "backend": backend.kind.value if backend else "none",
                 "session_id": backend.session_id if backend else 0,
+                # Non-null only when failover is off -- the one case in which
+                # the backend cannot change under a caller mid-measurement.
+                "forced_backend": self._forced.value if self._forced else None,
                 "healthy": backend.healthy(self.deadline) if backend else False,
                 "distinct": backend.distinct if backend else 0,
                 "publish_rate": backend.publish_rate() if backend else 0.0,

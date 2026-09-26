@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "gamelens": {
+      "command": "B:/AI_Agent_folder/GAME VIDEO/.venv/Scripts/python.exe",
+      "args": ["-m", "gamelens.mcp"],
+      "env": {
+        "GAMELENS_URL": "http://127.0.0.1:8777"
+      }
+    }
+  }
+}

@@ -1,5 +1,5 @@
 # --- capture ---
-windows-capture==1.4.2   # Windows Graphics Capture (Rust-backed, GPU path)
+windows-capture==1.4.2   # WGC. NOT 2.0.1: it crashes the process when a session restarts (README)
 mss==9.0.1               # DXGI-ish fallback / multi-monitor full-screen
 pywin32==306             # window enumeration, client<->screen mapping
 

@@ -44,6 +44,11 @@ class Denial(Enum):
     WATCHDOG_STALE = "safety watchdog heartbeat is stale"
     TARGET_GONE = "target window no longer exists"
     GUARD_ERROR = "guard raised; denying by default"
+    # Checked by the executor at each press rather than by check(): they are
+    # about the input about to be sent, which check() never sees (GL-040).
+    POINTER_OFF_TARGET = "the cursor is not over the target window"
+    FOREIGN_MODIFIER = "a modifier GameLens did not press is held down"
+    UNRELEASED_INPUT = "an earlier release failed; input may still be held"
 
 
 class NotPermitted(RuntimeError):
@@ -334,6 +339,11 @@ class SafetySupervisor:
     @property
     def target_hwnd(self) -> int:
         return self._hwnd
+
+    @property
+    def rate_capacity(self) -> float:
+        """The most actions the rate limiter can ever admit in one burst."""
+        return self._bucket.capacity
 
     def snapshot(self) -> dict:
         with self._lock:
