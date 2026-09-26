@@ -7,8 +7,7 @@ Three properties this module has to hold and which are easy to get wrong:
   while a consumer is mid-JPEG. Buffers are pooled and refcounted instead.
 * **A duplicate delivery is not a new frame.** windows-capture 1.4.2 invokes the
   frame handler twice for the same frame when the row pitch is padded, so frames
-  are deduplicated on the native timespan. 2.0 calls it once; the dedupe stays,
-  because it costs nothing and does not depend on the version.
+  are deduplicated on the native timespan.
 * **A blocked backend cannot wedge the pipeline.** PrintWindow is serviced by the
   target application and may never return, so it runs in a killable helper
   process supervised from outside, and results from a retired session are fenced
@@ -59,9 +58,10 @@ _wgc_hwnd: bool | None = None
 def wgc_selects_by_hwnd() -> bool:
     """Whether the installed windows-capture can bind a window by its HWND.
 
-    2.0 added ``window_hwnd``; 1.4.2 binds by title only, and 2.0 turned
-    ``window_name`` into a substring match, so the title path is kept only as
-    the fallback for an old install. Decided once, from the signature.
+    2.0 added ``window_hwnd`` (and turned ``window_name`` into a substring match,
+    so an HWND-capable library is never asked by title). 1.4.2, the pinned
+    version, binds by title only: 2.0.1 crashes on a session restart (README).
+    Decided once, from the signature.
     """
     global _wgc_hwnd
     if _wgc_hwnd is None:
@@ -73,6 +73,48 @@ def wgc_selects_by_hwnd() -> bool:
         except Exception:
             _wgc_hwnd = False
     return _wgc_hwnd
+
+
+_graphics_capture_pinned = False
+
+
+def pin_graphics_capture() -> bool:
+    """Keep GraphicsCapture.dll loaded for the life of the process.
+
+    Found on the Hyper-V VM with windows-capture 2.0.1: when a session ends and
+    no other WGC object is alive, COM may unload the DLL while the ending
+    session's callback thread is still running in it -- an access violation in
+    "GraphicsCapture.dll_unloaded" that kills the whole process, with no Python
+    traceback (2 of 7 Java world reloads, each of which starves WGC and forces a
+    restart). Pinning makes that unload impossible. It did not make 2.0.1 safe:
+    the next reload faulted inside windows_capture.pyd instead, which is why
+    1.4.2 stays pinned. Cheap, and it closes one way to die on any version.
+    Done once, before the first session; a failure is logged and capture
+    proceeds as before.
+    """
+    global _graphics_capture_pinned
+    if _graphics_capture_pinned or not _sys.platform.startswith("win"):
+        return _graphics_capture_pinned
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LoadLibraryW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleExW.argtypes = (
+            wintypes.DWORD, wintypes.LPCWSTR, ctypes.POINTER(wintypes.HMODULE))
+        if not kernel32.LoadLibraryW("GraphicsCapture.dll"):
+            raise ctypes.WinError(ctypes.get_last_error())
+        GET_MODULE_HANDLE_EX_FLAG_PIN = 0x1
+        module = wintypes.HMODULE()
+        if not kernel32.GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN, "GraphicsCapture.dll", ctypes.byref(module)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        _graphics_capture_pinned = True
+    except Exception:
+        log.warning("could not pin GraphicsCapture.dll; a WGC restart may crash the process",
+                    exc_info=True)
+    return _graphics_capture_pinned
 
 # Identity is verified on every published frame. An earlier revision throttled
 # the enumerating half to 4Hz on cost grounds, which was wrong twice over: the
@@ -529,6 +571,7 @@ class WgcBackend(CaptureBackend):
 
     def start(self) -> None:
         self.binding.verify(require_title_ownership=not self.by_hwnd)
+        pin_graphics_capture()
         self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
         if not WGC_BORDER_TOGGLE_SUPPORTED:
             log.info(

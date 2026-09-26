@@ -68,6 +68,8 @@ def library(monkeypatch):
         monkeypatch.setattr(capture, "title_still_owned_by", lambda hwnd, title: title_owned)
         monkeypatch.setattr(capture, "describe", lambda hwnd: SimpleNamespace(
             width=8, height=6, client_width=8, client_height=6))
+        monkeypatch.setattr(capture, "pin_graphics_capture",
+                            lambda: calls.append("pinned") or True)
         return calls
     return install
 
@@ -88,8 +90,8 @@ def test_binds_by_hwnd_and_never_by_title(library):
     calls = library(hwnd_keyword=True, title_owned=True)
     wgc = backend()
     wgc.start()
-    assert calls[0]["window_hwnd"] == 4242
-    assert calls[0]["window_name"] is None      # a substring match in 2.0: never used
+    assert calls[1]["window_hwnd"] == 4242
+    assert calls[1]["window_name"] is None      # a substring match in 2.0: never used
 
 
 def test_a_shared_title_does_not_stop_an_hwnd_binding(library):
@@ -98,7 +100,7 @@ def test_a_shared_title_does_not_stop_an_hwnd_binding(library):
     calls = library(hwnd_keyword=True, title_owned=False)
     wgc = backend()
     wgc.start()
-    handler = calls[0]["capture"].handlers["on_frame_arrived"]
+    handler = calls[1]["capture"].handlers["on_frame_arrived"]
     stopped = []
     handler(SimpleNamespace(frame_buffer=np.zeros((6, 8, 4), np.uint8), timespan=7),
             SimpleNamespace(stop=lambda: stopped.append(True)))
@@ -109,7 +111,7 @@ def test_a_shared_title_does_not_stop_an_hwnd_binding(library):
 def test_old_library_still_binds_by_title_and_demands_ownership(library):
     calls = library(hwnd_keyword=False, title_owned=True)
     backend().start()
-    assert calls[0] == {"window_name": "Minecraft", "capture": calls[0]["capture"]}
+    assert calls[1] == {"window_name": "Minecraft", "capture": calls[1]["capture"]}
 
     library(hwnd_keyword=False, title_owned=False)
     with pytest.raises(IdentityLost):
@@ -144,3 +146,18 @@ def test_supervisor_skips_wgc_for_a_shared_title_only_when_bound_by_title(
         assert sup.backend.kind is first
     finally:
         sup.stop()
+
+
+def test_the_dll_is_pinned_before_the_first_session(library):
+    # An unpinned GraphicsCapture.dll can be unloaded under a session that is
+    # still ending: a native crash, no traceback (Java world reloads, 2026-09-26).
+    calls = library(hwnd_keyword=True, title_owned=True)
+    backend().start()
+    assert calls[0] == "pinned" and "window_hwnd" in calls[1]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows only")
+def test_pinning_works_on_this_machine(monkeypatch):
+    monkeypatch.setattr(capture, "_graphics_capture_pinned", False)
+    assert capture.pin_graphics_capture() is True
+    assert capture.pin_graphics_capture() is True          # idempotent
