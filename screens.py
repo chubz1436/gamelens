@@ -271,17 +271,68 @@ def in_world(arr):
     band = arr[y0:y1, left:min(w, x1 + pad), :3]
     if band.size == 0:
         return False
+    if _outline_in(_bright_cover(band), (x1 - x0) / 9.0):
+        return True
+    return _hotbar_anywhere(arr)
+
+
+def _bright(band):
     hsv = cv2.cvtColor(np.ascontiguousarray(band), cv2.COLOR_BGR2HSV)
-    bright = (hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)
-    cover = bright.mean(axis=0)
+    return (hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)
+
+
+def _bright_cover(band):
+    return _bright(band).mean(axis=0)
+
+
+def _outline_in(cover, step):
+    """Two bright sides about one slot apart with mostly dark columns between."""
     sides = np.flatnonzero(cover >= 0.5)
-    step = (x1 - x0) / 9.0
-    for a in sides:
-        for b in sides:
-            if 0.85 * step <= b - a <= 1.40 * step:
-                inside = cover[a + 3:b - 2]
-                if inside.size and inside.mean() < 0.4:
-                    return True
+    if sides.size < 2:
+        return False
+    gap = sides[None, :] - sides[:, None]
+    for i, j in zip(*np.nonzero((gap >= 0.85 * step) & (gap <= 1.40 * step))):
+        inside = cover[sides[i] + 3:sides[j] - 2]
+        if inside.size and inside.mean() < 0.4:
+            return True
+    return False
+
+
+# Java sizes its HUD by an integer GUI scale chosen from the window size, so
+# HOTBAR's fractions hold only near the 870x519 window they were measured on.
+# Maximized in the test VM (1024-1280 wide frames) the fixed band read False in
+# the world on every frame (2026-09-26). What holds at every size: the hotbar is
+# centred and sits on the bottom of the client area, so only its scale is
+# unknown, and that is what gets searched.
+HOTBAR_PITCH_MIN = 8.0        # slot pitch in frame pixels (20 GUI px x scale)
+
+
+def _hotbar_anywhere(arr):
+    """The `in_world` outline test, at every hotbar scale.
+
+    Same side-and-interior test, same thresholds, applied to a centred band
+    9.1 pitches wide and 1.1 high on the bottom of the frame, for pitches from
+    8 px in half-pixel steps. A PrintWindow frame's 8 px window border below the
+    hotbar does not matter: the band still holds most of the outline's sides,
+    and searching border offsets changed no result. Checked against every Java frame on
+    record -- the calibrated 856/870 captures and maximized 1024, 1040 and 1280
+    wide ones through both WGC and PrintWindow: every world positive, no pause
+    menu, inventory, death screen, dialog, Options or crafting screen positive.
+    Costs a few ms, and only runs when the fixed band says no.
+    """
+    h, w = arr.shape[:2]
+    r0 = int(h * 0.75)
+    bright = _bright(arr[r0:, :, :3]).astype(np.int32)
+    rows = bright.shape[0]
+    cum = np.vstack([np.zeros((1, w), np.int32), np.cumsum(bright, axis=0)])
+    for pitch in np.arange(HOTBAR_PITCH_MIN, min(0.099 * w, rows / 1.1), 0.5):
+        height = int(round(1.1 * pitch))
+        pad = max(2, int(0.1 * pitch))
+        xa = max(0, int(w / 2 - 4.55 * pitch) - pad)
+        xb = min(w, int(w / 2 + 4.55 * pitch) + pad)
+        y0 = rows - height
+        if _outline_in((cum[rows, xa:xb] - cum[y0, xa:xb]) / height, pitch):
+            return True
     return False
 
 

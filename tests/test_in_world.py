@@ -223,9 +223,58 @@ def test_bedrock_screens_that_are_not_the_world(name):
     assert screens.bedrock_in_world(load(name)) is False
 
 
-def test_the_java_probe_misses_bedrock_at_the_vm_size():
-    """Why a second probe exists: the hotbar is where `in_world` does not look."""
-    assert screens.in_world(load("bedrock_vm_world_item_selected")) is False
+def test_the_java_probe_is_still_wrong_for_bedrock():
+    """Why a second probe exists: Bedrock fades its menus in over a live HUD.
+
+    Since the hotbar search, `in_world` finds Bedrock's hotbar at any size too --
+    but it reads an inventory still fading in as the world.
+    """
+    assert screens.in_world(load("bedrock_host_inventory_fading")) is True
+    assert screens.bedrock_in_world(load("bedrock_host_inventory_fading")) is False
+
+
+# --- Java at other window sizes ------------------------------------------------
+#
+# Java 26.3 demo in the Hyper-V VM, maximized: 1024/1040 and 1280-wide frames
+# through PrintWindow ("pw", window rect with borders) and WGC. The fixed band
+# read False in the world on every one of them (2026-09-26).
+
+
+@pytest.mark.parametrize("name", [
+    "java_1280_world_pw",
+    "java_1280_world_wgc",
+    "java_1040_world_leaves",
+])
+def test_java_world_is_recognised_maximized(name):
+    assert screens.in_world(load(name)) is True
+
+
+@pytest.mark.parametrize("name", [
+    "java_1280_pause_pw",
+    "java_1280_pause_wgc",
+    "java_1280_inventory_pw",            # the hotbar row inside the inventory panel
+    "java_1280_inventory_wgc",
+    "java_1280_death_pw",                # HUD drawn, but dimmed under red
+    "java_1040_demo_dialog",
+    "java_1024_pause",
+])
+def test_java_screens_that_are_not_the_world_maximized(name):
+    assert screens.in_world(load(name)) is False
+
+
+def test_any_slot_is_seen_maximized():
+    """The search looks where the hotbar is -- centred -- not just where slot 1 is."""
+    mirrored = np.ascontiguousarray(load("java_1280_world_pw")[:, ::-1])   # slot 1 -> slot 9
+    assert screens.in_world(mirrored) is True
+
+
+def test_the_fixed_band_alone_misses_the_maximized_world():
+    """What the search is for: HOTBAR's fractions are wrong at this size."""
+    arr = load("java_1280_world_pw")
+    h, w = arr.shape[:2]
+    fx0, fy0, fx1, fy1 = screens.HOTBAR
+    band = arr[int(h * fy0):int(h * fy1), int(w * fx0):int(w * fx1), :3]
+    assert not screens._outline_in(screens._bright_cover(band), (fx1 - fx0) * w / 9.0)
 
 
 def test_bedrock_probe_on_nothing():
