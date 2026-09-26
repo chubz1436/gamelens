@@ -133,11 +133,15 @@ These are real and not worked around:
   its window (Java: "Minecraft 26.3" -> "Minecraft 26.3 - Singleplayer") loses WGC until
   restart. Use `--backend printwindow` when you need HWND-exact capture. GameLens binds by
   HWND automatically when the installed library offers `window_hwnd` (2.0+).
-- **Do not install `windows-capture` 2.0.1.** It has `window_hwnd` and delivers each frame once,
-  but it kills the whole process -- an access violation, no Python traceback -- when a WGC
-  session is restarted while the game is not presenting. Measured on the Hyper-V VM: 2 of 7
-  Java world reloads, first in `GraphicsCapture.dll` after it was unloaded, and, with that DLL
-  pinned, on the next reload inside `windows_capture.pyd` itself.
+- **`windows-capture` can crash natively when a WGC session restarts** -- an access
+  violation, no Python traceback. Measured on the Hyper-V VM: 2.0.1 on 2 of 7 Java world
+  reloads (first in `GraphicsCapture.dll` after it was unloaded, then, with that DLL pinned,
+  inside `windows_capture.pyd`), and 1.4.2 inside `windows_capture.pyd` when an Enhanced Session
+  connect starved WGC and it was tried again. So WGC runs in its own worker process, like
+  PrintWindow: a crash costs the worker, the log says `wgc worker exited (code 0xc0000005)`,
+  and capture fails over to PrintWindow and later promotes back. GameLens itself stays up. The
+  pin stays at 1.4.2: 2.0.1 has `window_hwnd` and delivers each frame once, but it has not been
+  re-measured since the move.
 - **Games using RawInput with `RIDEV_NOLEGACY`, or anti-cheat, may ignore `SendInput`.** It
   is a documented user-mode API and GameLens does not try to defeat anything. No kernel
   drivers, no evasion. Whether automating a given game is permitted is your call.

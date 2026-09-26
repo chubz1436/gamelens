@@ -59,8 +59,27 @@ DLL pinning and the job object's pywin32 usage had no findings. Five findings, a
 Fixed in b23fec4. 580 tests in the guest; all mutants killed (8 detector, 5 others; two
 survivors were answered by simplifying: an equivalent `now=` argument dropped, a test sharpened).
 
+## Inspection 4 — GL-044, WGC in a worker process
+
+windows-capture 1.4.2 crashed GameLens natively (access violation in `windows_capture.pyd`) when
+the supervisor retried WGC after an Enhanced Session connect (2026-09-26 21:09), so the "1.4.2 is
+safe" pin was wrong. WGC now runs in a child process sharing PrintWindow's frame slot and parent
+base class. Codex, on the diff: two findings, both accepted.
+
+- **RV04-I01 (medium)** A start failing after the child launched left it unsupervised; each retry
+  could add one. → partial startup is torn down; the reader is kept only once it has started.
+- **RV04-I02 (medium)** The fixed 4K slot refused larger windows on both worker backends, leaving
+  only mss. → the slot is sized from the target and the virtual screen.
+
+In the guest: 563 pass; the 29 input tests that need a foreground window fail identically on
+master while the VM session is disconnected. A real child crash (a native thread at an unmapped
+address) ends the worker with 0xc0000005 while the test process stays up. Live on Java: five WGC
+retries in a disconnected session, each failing over to PrintWindow, one worker alive at a time;
+a hard kill of GameLens left no python process.
+
 ## Status
 
-Three rounds. The round-3 fixes have not been independently inspected. Known margin, measured
+Four rounds. The round-4 fixes have not been independently inspected, and the exact
+21:09 trigger (an Enhanced Session connect while GameLens runs) has not been replayed. Known margin, measured
 live: on Bedrock's Play screen a late click on an opaque button at +4 s scored global 1.67 over
 the still tiles against a limit of 2.0 (records expire at 5 s).

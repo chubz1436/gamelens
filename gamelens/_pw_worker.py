@@ -13,20 +13,15 @@ producing; it never waits for the blocked call to come back.
 from __future__ import annotations
 
 import ctypes
-import multiprocessing
 import time
 from multiprocessing.shared_memory import SharedMemory
 
-PW_RENDERFULLCONTENT = 0x00000002
+from gamelens._frame_shm import (  # noqa: F401  (the layout is re-exported for callers)
+    CTRL_COUNTER, CTRL_ERROR, CTRL_HEIGHT, CTRL_SIZE, CTRL_STOP, CTRL_TIMESPAN, CTRL_TYPECODE,
+    CTRL_VERSION, CTRL_WIDTH, ERR_FAILED, ERR_TOO_BIG, no_crash_dialog, orphaned, write_frame,
+)
 
-# Layout of the shared control array (all ints):
-CTRL_STOP = 0        # parent sets 1 to ask for a clean exit
-CTRL_COUNTER = 1     # child bumps on each successful capture
-CTRL_WIDTH = 2
-CTRL_HEIGHT = 3
-CTRL_ERROR = 4       # child sets 1 on a fatal error
-CTRL_VERSION = 5     # seqlock: odd while writing, even when a frame is settled
-CTRL_SIZE = 6
+PW_RENDERFULLCONTENT = 0x00000002
 
 
 def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
@@ -40,14 +35,13 @@ def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
     import win32ui
 
     shm: SharedMemory | None = None
+    no_crash_dialog()
     try:
         shm = SharedMemory(name=shm_name)
         user32 = ctypes.windll.user32
 
-        parent = multiprocessing.parent_process()
         while not ctrl[CTRL_STOP]:
-            if parent is not None and not parent.is_alive():
-                # Orphaned before the parent could tie us to its job (RV03-I03).
+            if orphaned():
                 return
             try:
                 left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -59,7 +53,7 @@ def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
                     # Window grew past the buffer the parent allocated. Signal
                     # rather than truncate: a silently cropped frame would map
                     # coordinates wrong.
-                    ctrl[CTRL_ERROR] = 1
+                    ctrl[CTRL_ERROR] = ERR_TOO_BIG
                     return
 
                 window_dc = win32gui.GetWindowDC(hwnd)
@@ -76,18 +70,7 @@ def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
                         hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT
                     )
                     if ok:
-                        bits = bitmap.GetBitmapBits(True)
-                        # Seqlock. The pixels and the dimensions that describe
-                        # them must be read together or not at all: a reader
-                        # that catches us mid-write would otherwise copy half of
-                        # one frame and half of the next, or read this frame's
-                        # pixels with the previous frame's width.
-                        ctrl[CTRL_VERSION] = ctrl[CTRL_VERSION] + 1     # -> odd
-                        shm.buf[: len(bits)] = bits
-                        ctrl[CTRL_WIDTH] = width
-                        ctrl[CTRL_HEIGHT] = height
-                        ctrl[CTRL_COUNTER] = ctrl[CTRL_COUNTER] + 1
-                        ctrl[CTRL_VERSION] = ctrl[CTRL_VERSION] + 1     # -> even
+                        write_frame(shm, ctrl, bitmap.GetBitmapBits(True), width, height)
                 finally:
                     try:
                         win32gui.DeleteObject(bitmap.GetHandle())
@@ -97,13 +80,13 @@ def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
                     except Exception:
                         pass
             except Exception:
-                ctrl[CTRL_ERROR] = 1
+                ctrl[CTRL_ERROR] = ERR_FAILED
                 return
 
             time.sleep(interval)
     except Exception:
         try:
-            ctrl[CTRL_ERROR] = 1
+            ctrl[CTRL_ERROR] = ERR_FAILED
         except Exception:
             pass
     finally:

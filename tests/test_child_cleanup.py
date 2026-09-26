@@ -186,3 +186,66 @@ def test_the_worker_exits_on_its_own_once_orphaned(monkeypatch):
         shm.unlink()
     assert not still_running
     assert looked == []                          # left before touching the window
+
+
+def test_a_start_that_fails_part_way_leaves_no_worker(monkeypatch):
+    # RV04-I01 (Codex): the supervisor drops a backend whose start raised without
+    # stopping it, so whatever start had already launched must be gone by then.
+    from types import SimpleNamespace
+
+    from gamelens import capture
+
+    events = []
+
+    class FakeProc:
+        pid = 4321
+        exitcode = None
+
+        def __init__(self, **kw):
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            events.append("terminate")
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            pass
+
+    class NoThread:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(capture.mp, "Process", FakeProc)
+    monkeypatch.setattr(capture, "die_with_this_process", lambda pid: True)
+    monkeypatch.setattr(capture.threading, "Thread", NoThread)
+    backend = capture.PrintWindowBackend(
+        SimpleNamespace(hwnd=1, title="Game", width=4, height=4,
+                        verify=lambda **kw: None),
+        capture.FramePool(), capture.LatestFrame(), max_pixels=16)
+    with pytest.raises(RuntimeError):
+        backend.start()
+    assert events == ["terminate"]
+    assert backend.retired and backend._proc is None and backend._shm is None
+
+
+def test_the_frame_slot_fits_a_target_larger_than_4k():
+    # RV04-I02 (Codex): a fixed 4K slot refused a 5K window on both worker
+    # backends and left only mss.
+    from types import SimpleNamespace
+
+    from gamelens import capture
+
+    assert capture.slot_pixels(SimpleNamespace(width=5120, height=2880)) >= 5120 * 2880
+    assert capture.slot_pixels(SimpleNamespace(width=800, height=600)) >= capture.MIN_SLOT_PIXELS
