@@ -695,6 +695,52 @@ class MssBackend(CaptureBackend):
         self._thread = None
 
 
+_kill_job = None
+_kill_job_lock = threading.Lock()
+
+
+def die_with_this_process(pid: int) -> bool:
+    """Tie child *pid* to this process: when GameLens exits, however it exits, so does the child.
+
+    ``daemon=True`` only covers a clean interpreter exit. Found on the Hyper-V VM:
+    GameLens killed hard (Stop-Process) left its PrintWindow worker running with
+    no parent, still holding the log file the next GameLens run needed. A job
+    object with KILL_ON_JOB_CLOSE is closed by the kernel when this process dies,
+    and that terminates every process in it -- including one blocked inside
+    PrintWindow, which could never notice its parent had gone. One job for the
+    process lifetime; its handle is deliberately never closed.
+    """
+    global _kill_job
+    if not _sys.platform.startswith("win"):
+        return False
+    try:
+        import win32api
+        import win32con
+        import win32job
+
+        with _kill_job_lock:
+            if _kill_job is None:
+                job = win32job.CreateJobObject(None, "")
+                info = win32job.QueryInformationJobObject(
+                    job, win32job.JobObjectExtendedLimitInformation)
+                info["BasicLimitInformation"]["LimitFlags"] |= (
+                    win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+                win32job.SetInformationJobObject(
+                    job, win32job.JobObjectExtendedLimitInformation, info)
+                _kill_job = job
+            child = win32api.OpenProcess(
+                win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE, False, pid)
+            try:
+                win32job.AssignProcessToJobObject(_kill_job, child)
+            finally:
+                win32api.CloseHandle(child)
+        return True
+    except Exception:
+        log.warning("could not tie child %d to this process; it may outlive a hard kill",
+                    pid, exc_info=True)
+        return False
+
+
 class PrintWindowBackend(CaptureBackend):
     """PrintWindow, driven from a child process so it can be killed.
 
@@ -731,6 +777,7 @@ class PrintWindowBackend(CaptureBackend):
             daemon=True,
         )
         self._proc.start()
+        die_with_this_process(self._proc.pid)
 
         self._reader = threading.Thread(
             target=self._read_loop, name="gamelens-pw-reader", daemon=True
