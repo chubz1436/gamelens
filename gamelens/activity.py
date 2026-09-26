@@ -117,6 +117,11 @@ class ActivityMap:
         run ahead of the poller across a resize (GL042-RV02-I02). None means
         "nothing known to be moving" and is treated as all still, which is the
         strict direction.
+
+        The window ends at ``now`` -- the moment of asking -- not at the last
+        sample (RV03-I01, Codex): if sampling stalled, the latest
+        bucket is empty and nothing counts as moving, rather than motion from
+        before the stall being carried forward onto a frame that no longer shows it.
         """
         now = time.monotonic() if now is None else now
         with self._lock:
@@ -131,7 +136,7 @@ class ActivityMap:
                     and (until_frame_id is None or fid <= until_frame_id)]
         if len(kept) < 2:
             return None
-        end = kept[-1][0]
+        end = max(now, kept[-1][0])
         span = self.window / self.buckets
         count = np.zeros(kept[0][1].shape[:2], np.int16)
         latest = np.zeros(kept[0][1].shape[:2], bool)

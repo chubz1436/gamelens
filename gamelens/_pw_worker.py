@@ -13,6 +13,7 @@ producing; it never waits for the blocked call to come back.
 from __future__ import annotations
 
 import ctypes
+import multiprocessing
 import time
 from multiprocessing.shared_memory import SharedMemory
 
@@ -43,7 +44,11 @@ def run(hwnd: int, shm_name: str, ctrl, interval: float = 0.008) -> None:
         shm = SharedMemory(name=shm_name)
         user32 = ctypes.windll.user32
 
+        parent = multiprocessing.parent_process()
         while not ctrl[CTRL_STOP]:
+            if parent is not None and not parent.is_alive():
+                # Orphaned before the parent could tie us to its job (RV03-I03).
+                return
             try:
                 left, top, right, bottom = win32gui.GetWindowRect(hwnd)
                 width, height = right - left, bottom - top

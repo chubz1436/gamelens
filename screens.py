@@ -285,15 +285,32 @@ def _bright_cover(band):
     return _bright(band).mean(axis=0)
 
 
-def _outline_in(cover, step):
-    """Two bright sides about one slot apart with mostly dark columns between."""
-    sides = np.flatnonzero(cover >= 0.5)
-    if sides.size < 2:
+def _outline_in(cover, step, top=None):
+    """Two bright sides about one slot apart with mostly dark columns between.
+
+    ``cover``: per column, the share of the band's rows that is bright. With
+    ``top`` (per column, bright anywhere just above the band) the pair must also
+    be joined by a top edge -- a closed box, not two strokes (RV03-I04).
+    Vectorised over positions for each allowed gap, so the work is bounded by
+    the band's width whatever the content: a bright screen used to cost a
+    Python-level check per pair of its columns (RV03-I05).
+    """
+    n = cover.size
+    side = cover >= 0.5
+    if np.count_nonzero(side) < 2:
         return False
-    gap = sides[None, :] - sides[:, None]
-    for i, j in zip(*np.nonzero((gap >= 0.85 * step) & (gap <= 1.40 * step))):
-        inside = cover[sides[i] + 3:sides[j] - 2]
-        if inside.size and inside.mean() < 0.4:
+    csum = np.concatenate(([0.0], np.cumsum(cover)))
+    tsum = None if top is None else np.concatenate(([0.0], np.cumsum(top)))
+    for gap in range(max(6, int(np.ceil(0.85 * step))), int(np.floor(1.40 * step)) + 1):
+        if gap >= n:
+            break
+        a = np.flatnonzero(side[:n - gap] & side[gap:])
+        if a.size == 0:
+            continue
+        ok = (csum[a + gap - 2] - csum[a + 3]) / (gap - 5) < 0.4
+        if tsum is not None:
+            ok &= (tsum[a + gap + 1] - tsum[a]) / (gap + 1) >= 0.7
+        if ok.any():
             return True
     return False
 
@@ -305,6 +322,7 @@ def _outline_in(cover, step):
 # centred and sits on the bottom of the client area, so only its scale is
 # unknown, and that is what gets searched.
 HOTBAR_PITCH_MIN = 8.0        # slot pitch in frame pixels (20 GUI px x scale)
+HOTBAR_SEARCH_WIDTH = 1280    # larger frames are shrunk first: bounds the work
 
 
 def _hotbar_anywhere(arr):
@@ -318,9 +336,20 @@ def _hotbar_anywhere(arr):
     record -- the calibrated 856/870 captures and maximized 1024, 1040 and 1280
     wide ones through both WGC and PrintWindow: every world positive, no pause
     menu, inventory, death screen, dialog, Options or crafting screen positive.
-    Costs a few ms, and only runs when the fixed band says no.
+    Unlike the fixed band it also demands the outline's top edge: a search over
+    scales gets many chances, and two bright strokes on a menu's footer must not
+    be enough (RV03-I04, Codex). The edge is looked for within a fifth of a
+    pitch of the band's top; that held on every real frame, PrintWindow's 8 px
+    border below the hotbar included.
+
+    Tens of ms at most, and only runs when the fixed band says no.
     """
     h, w = arr.shape[:2]
+    if w > HOTBAR_SEARCH_WIDTH:
+        k = HOTBAR_SEARCH_WIDTH / w
+        arr = cv2.resize(np.ascontiguousarray(arr[:, :, :3]),
+                         (HOTBAR_SEARCH_WIDTH, max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+        h, w = arr.shape[:2]
     r0 = int(h * 0.75)
     bright = _bright(arr[r0:, :, :3]).astype(np.int32)
     rows = bright.shape[0]
@@ -331,7 +360,10 @@ def _hotbar_anywhere(arr):
         xa = max(0, int(w / 2 - 4.55 * pitch) - pad)
         xb = min(w, int(w / 2 + 4.55 * pitch) + pad)
         y0 = rows - height
-        if _outline_in((cum[rows, xa:xb] - cum[y0, xa:xb]) / height, pitch):
+        t0 = max(0, int(y0 - 0.2 * pitch))
+        t1 = min(rows, int(y0 + 0.2 * pitch) + 1)
+        top = (cum[t1, xa:xb] - cum[t0, xa:xb]) > 0
+        if _outline_in((cum[rows, xa:xb] - cum[y0, xa:xb]) / height, pitch, top):
             return True
     return False
 

@@ -131,7 +131,8 @@ def fake_class(kind, started):
     return Fake
 
 
-@pytest.mark.parametrize("by_hwnd, first", [(True, Backend.WGC), (False, Backend.PRINTWINDOW)])
+@pytest.mark.parametrize("by_hwnd, first", [(True, Backend.WGC), (False, Backend.PRINTWINDOW),
+                                            (None, Backend.PRINTWINDOW)])
 def test_supervisor_skips_wgc_for_a_shared_title_only_when_bound_by_title(
         monkeypatch, by_hwnd, first):
     started: list = []
@@ -161,3 +162,22 @@ def test_pinning_works_on_this_machine(monkeypatch):
     monkeypatch.setattr(capture, "_graphics_capture_pinned", False)
     assert capture.pin_graphics_capture() is True
     assert capture.pin_graphics_capture() is True          # idempotent
+
+
+def test_an_unreadable_library_is_unknown_not_legacy(library, monkeypatch):
+    # RV03-I02 (Codex): a failed import taken as "1.4.2" would later ask 2.x by
+    # title, which 2.x matches as a substring.
+    monkeypatch.setitem(sys.modules, "windows_capture", None)      # import raises
+    monkeypatch.setattr(capture, "_wgc_hwnd", None)
+    assert capture.wgc_selects_by_hwnd() is None
+    assert capture._wgc_hwnd is None                               # not cached
+    library(hwnd_keyword=True, title_owned=True)
+    assert capture.wgc_selects_by_hwnd() is True
+
+
+def test_wgc_refuses_to_start_when_the_library_is_unknown(library, monkeypatch):
+    calls = library(hwnd_keyword=True, title_owned=True)
+    monkeypatch.setattr(capture, "wgc_selects_by_hwnd", lambda: None)
+    with pytest.raises(RuntimeError):
+        backend().start()
+    assert not any(isinstance(c, dict) for c in calls)             # nothing was bound

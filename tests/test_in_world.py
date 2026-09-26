@@ -314,3 +314,31 @@ def test_bedrock_shapes_that_are_not_the_selection(what, draw):
     img = np.zeros((674, 1280, 3), np.uint8)
     draw(img)
     assert screens.bedrock_in_world(img) is False, what
+
+
+def test_two_strokes_are_not_a_hotbar():
+    # RV03-I04 (Codex): two bright columns on a menu's footer passed the search.
+    arr = np.zeros((720, 1280, 3), np.uint8)
+    arr[711:720, 630] = 255
+    arr[711:720, 640] = 255
+    assert screens.in_world(arr) is False
+
+
+def test_a_closed_outline_at_an_uncalibrated_scale_is():
+    # The same strokes joined by a top edge, one slot pitch (33 px) wide, centred:
+    # what a selected slot looks like at a scale the fixed band was never fitted to.
+    arr = np.full((720, 1280, 3), 40, np.uint8)
+    x0, top = 640 - 4 * 33 - 20, 720 - 38
+    arr[top:720, x0:x0 + 3] = 255
+    arr[top:720, x0 + 37:x0 + 40] = 255
+    arr[top:top + 3, x0:x0 + 40] = 255
+    assert screens.in_world(arr) is True
+
+
+def test_a_bright_screen_is_refused_quickly():
+    # RV03-I05 (Codex): a white frame cost a Python-level check per column pair.
+    import time
+    arr = np.full((2160, 3840, 3), 255, np.uint8)
+    t = time.perf_counter()
+    assert screens.in_world(arr) is False
+    assert time.perf_counter() - t < 1.0

@@ -84,6 +84,17 @@ def test_motion_older_than_the_window_is_forgotten():
     assert not amap.snapshot(now=now).any()
 
 
+def test_a_stall_in_sampling_does_not_carry_old_motion_forward():
+    # RV03-I01 (Codex): 1.4 s of panorama, then no samples for 0.6 s while capture
+    # went on. The handed-out frame is from after the stall; the panorama's motion
+    # must not be pinned onto it.
+    amap = ActivityMap()
+    last = feed_run(amap, [with_band(scene(), i) for i in range(29)])   # 1.4 s
+    assert amap.snapshot(now=last).any()                               # moving before
+    assert amap.snapshot(until_frame_id=10**6, now=last + 0.6) is None or \
+        not amap.snapshot(until_frame_id=10**6, now=last + 0.6).any()
+
+
 def test_a_frame_id_seen_twice_counts_once():
     amap = ActivityMap()
     amap.feed(scene(), 1, 0, now=1.0)

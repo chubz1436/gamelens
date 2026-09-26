@@ -55,13 +55,19 @@ WGC_BORDER_TOGGLE_SUPPORTED = (
 _wgc_hwnd: bool | None = None
 
 
-def wgc_selects_by_hwnd() -> bool:
+def wgc_selects_by_hwnd() -> bool | None:
     """Whether the installed windows-capture can bind a window by its HWND.
 
     2.0 added ``window_hwnd`` (and turned ``window_name`` into a substring match,
     so an HWND-capable library is never asked by title). 1.4.2, the pinned
     version, binds by title only: 2.0.1 crashes on a session restart (README).
     Decided once, from the signature.
+
+    None when the library cannot be imported or inspected: unknown is not
+    "legacy" (RV03-I02, Codex). Taken as legacy, a later successful import of
+    2.x would be asked by title -- a substring match -- and could bind
+    "Minecraft Launcher" for "Minecraft". Unknown is not cached, and WGC refuses
+    to start on it.
     """
     global _wgc_hwnd
     if _wgc_hwnd is None:
@@ -71,7 +77,8 @@ def wgc_selects_by_hwnd() -> bool:
             from windows_capture import WindowsCapture
             _wgc_hwnd = "window_hwnd" in inspect.signature(WindowsCapture).parameters
         except Exception:
-            _wgc_hwnd = False
+            log.warning("cannot tell whether windows-capture binds by HWND", exc_info=True)
+            return None
     return _wgc_hwnd
 
 
@@ -570,6 +577,9 @@ class WgcBackend(CaptureBackend):
         self.by_hwnd = wgc_selects_by_hwnd()
 
     def start(self) -> None:
+        if self.by_hwnd is None:
+            raise RuntimeError("windows-capture is unavailable or could not be inspected; "
+                               "not binding WGC by title on a guess")
         self.binding.verify(require_title_ownership=not self.by_hwnd)
         pin_graphics_capture()
         self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
@@ -709,6 +719,10 @@ def die_with_this_process(pid: int) -> bool:
     and that terminates every process in it -- including one blocked inside
     PrintWindow, which could never notice its parent had gone. One job for the
     process lifetime; its handle is deliberately never closed.
+
+    The child runs for a moment before it is assigned; a kill landing in that
+    moment is covered by the worker itself, which exits when it sees its parent
+    gone (``_pw_worker.run``).
     """
     global _kill_job
     if not _sys.platform.startswith("win"):
@@ -777,7 +791,11 @@ class PrintWindowBackend(CaptureBackend):
             daemon=True,
         )
         self._proc.start()
-        die_with_this_process(self._proc.pid)
+        if not die_with_this_process(self._proc.pid):
+            # An unprotected worker can outlive a hard kill holding our files
+            # (RV03-I03, Codex): refuse this backend rather than run one.
+            self.stop()
+            raise RuntimeError("could not tie the printwindow worker to this process")
 
         self._reader = threading.Thread(
             target=self._read_loop, name="gamelens-pw-reader", daemon=True
@@ -966,7 +984,7 @@ class CaptureSupervisor:
             kind = self._order[i]
             cls = _BACKEND_CLASSES[kind]
 
-            if kind is Backend.WGC and not wgc_selects_by_hwnd() and not title_still_owned_by(
+            if kind is Backend.WGC and wgc_selects_by_hwnd() is not True and not title_still_owned_by(
                 self.binding.hwnd, self.binding.title
             ):
                 # Not an error: this WGC binds by title, and the title is either

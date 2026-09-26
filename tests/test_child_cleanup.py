@@ -101,7 +101,7 @@ def test_the_printwindow_worker_is_tied_when_it_starts(monkeypatch):
 
     tied = []
     monkeypatch.setattr(capture.mp, "Process", FakeProc)
-    monkeypatch.setattr(capture, "die_with_this_process", tied.append)
+    monkeypatch.setattr(capture, "die_with_this_process", lambda pid: tied.append(pid) or True)
     monkeypatch.setattr(capture, "is_alive", lambda hwnd: True)
     backend = capture.PrintWindowBackend(
         SimpleNamespace(hwnd=1, title="Game", width=4, height=4,
@@ -112,3 +112,77 @@ def test_the_printwindow_worker_is_tied_when_it_starts(monkeypatch):
         assert tied == [4321]
     finally:
         backend.stop()
+
+
+def test_an_untied_worker_is_refused_not_run(monkeypatch):
+    # RV03-I03 (Codex): a worker that could not be tied would outlive a hard kill.
+    from types import SimpleNamespace
+
+    from gamelens import capture
+
+    events = []
+
+    class FakeProc:
+        pid = 4321
+        exitcode = None
+
+        def __init__(self, **kw):
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            events.append("terminate")
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(capture.mp, "Process", FakeProc)
+    monkeypatch.setattr(capture, "die_with_this_process", lambda pid: False)
+    backend = capture.PrintWindowBackend(
+        SimpleNamespace(hwnd=1, title="Game", width=4, height=4,
+                        verify=lambda **kw: None),
+        capture.FramePool(), capture.LatestFrame(), max_pixels=16)
+    with pytest.raises(RuntimeError):
+        backend.start()
+    assert events == ["terminate"]
+    assert backend.retired and backend._reader is None and backend._shm is None
+
+
+def test_the_worker_exits_on_its_own_once_orphaned(monkeypatch):
+    # The moment before the job assignment: a parent killed then leaves a worker
+    # that must notice by itself.
+    import multiprocessing
+    from multiprocessing.shared_memory import SharedMemory
+
+    from gamelens import _pw_worker as worker
+
+    import win32gui
+
+    monkeypatch.setattr(multiprocessing, "parent_process",
+                        lambda: type("Gone", (), {"is_alive": lambda self: False})())
+    looked = []
+    monkeypatch.setattr(win32gui, "GetWindowRect", lambda h: looked.append(h) or (0, 0, 2, 2))
+    shm = SharedMemory(create=True, size=64)
+    ctrl = [0] * worker.CTRL_SIZE
+    import threading
+    t = threading.Thread(target=worker.run, args=(0, shm.name, ctrl), daemon=True)
+    try:
+        t.start()
+        t.join(2.0)
+        still_running = t.is_alive()
+    finally:
+        ctrl[worker.CTRL_STOP] = 1               # end it either way
+        t.join(2.0)
+        shm.close()
+        shm.unlink()
+    assert not still_running
+    assert looked == []                          # left before touching the window
