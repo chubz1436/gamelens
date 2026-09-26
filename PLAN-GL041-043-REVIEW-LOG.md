@@ -77,9 +77,16 @@ address) ends the worker with 0xc0000005 while the test process stays up. Live o
 retries in a disconnected session, each failing over to PrintWindow, one worker alive at a time;
 a hard kill of GameLens left no python process.
 
+Session-switch replay (the 21:09 class of trigger, without the host desktop): with GameLens on the
+Java title screen (WGC in its worker, 31.6 fps), session 1 was disconnected and reconnected to the
+console five times (`tsdiscon` / `tscon` from SYSTEM tasks). Thirteen capture sessions, six of them
+WGC starts across switches: no worker crash, GameLens up throughout, one worker at a time, and WGC
+promoted back afterwards (28.4 fps, correct picture). This does not prove the old in-process code
+would have crashed here -- it crashed once, on an RDP connect -- only that the new one survives it.
+
 ## Status
 
-Four rounds. The round-4 fixes have not been independently inspected, and the exact
-21:09 trigger (an Enhanced Session connect while GameLens runs) has not been replayed. Known margin, measured
+Four rounds. The round-4 fixes have not been independently inspected. The session switch
+was replayed via tscon/tsdiscon; an Enhanced Session (RDP) connect itself was not. Known margin, measured
 live: on Bedrock's Play screen a late click on an opaque button at +4 s scored global 1.67 over
 the still tiles against a limit of 2.0 (records expire at 5 s).
