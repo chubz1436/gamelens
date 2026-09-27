@@ -8,10 +8,11 @@ Three properties this module has to hold and which are easy to get wrong:
 * **A duplicate delivery is not a new frame.** windows-capture 1.4.2 invokes the
   frame handler twice for the same frame when the row pitch is padded, so frames
   are deduplicated on the native timespan.
-* **A blocked backend cannot wedge the pipeline.** PrintWindow is serviced by the
-  target application and may never return, so it runs in a killable helper
-  process supervised from outside, and results from a retired session are fenced
-  off rather than published late.
+* **A blocked or crashing backend cannot take GameLens with it.** PrintWindow is
+  serviced by the target application and may never return; windows-capture can
+  fault natively when a WGC session restarts. Both run in killable helper
+  processes supervised from outside, and results from a retired session are
+  fenced off rather than published late.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from enum import Enum
 
 import numpy as np
 
+from gamelens import _frame_shm
 from gamelens.windows import WindowInfo, describe, is_alive, title_still_owned_by
 
 log = logging.getLogger(__name__)
@@ -60,8 +62,8 @@ def wgc_selects_by_hwnd() -> bool | None:
 
     2.0 added ``window_hwnd`` (and turned ``window_name`` into a substring match,
     so an HWND-capable library is never asked by title). 1.4.2, the pinned
-    version, binds by title only: 2.0.1 crashes on a session restart (README).
-    Decided once, from the signature.
+    version, binds by title only (README). Decided once, from the signature --
+    importing the library here is harmless; only its sessions run in a worker.
 
     None when the library cannot be imported or inspected: unknown is not
     "legacy" (RV03-I02, Codex). Taken as legacy, a later successful import of
@@ -94,10 +96,11 @@ def pin_graphics_capture() -> bool:
     "GraphicsCapture.dll_unloaded" that kills the whole process, with no Python
     traceback (2 of 7 Java world reloads, each of which starves WGC and forces a
     restart). Pinning makes that unload impossible. It did not make 2.0.1 safe:
-    the next reload faulted inside windows_capture.pyd instead, which is why
-    1.4.2 stays pinned. Cheap, and it closes one way to die on any version.
-    Done once, before the first session; a failure is logged and capture
-    proceeds as before.
+    the next reload faulted inside windows_capture.pyd instead -- and 1.4.2 later
+    did the same (GL-044), which is why WGC now runs in a worker process
+    (``_wgc_worker``). Cheap, and it closes one way for that worker to die.
+    Done once per process, before the first session; a failure is logged and
+    capture proceeds as before.
     """
     global _graphics_capture_pinned
     if _graphics_capture_pinned or not _sys.platform.startswith("win"):
@@ -119,7 +122,7 @@ def pin_graphics_capture() -> bool:
             raise ctypes.WinError(ctypes.get_last_error())
         _graphics_capture_pinned = True
     except Exception:
-        log.warning("could not pin GraphicsCapture.dll; a WGC restart may crash the process",
+        log.warning("could not pin GraphicsCapture.dll; a WGC restart may crash the worker",
                     exc_info=True)
     return _graphics_capture_pinned
 
@@ -557,100 +560,6 @@ class CaptureBackend:
         return True
 
 
-class WgcBackend(CaptureBackend):
-    """Windows Graphics Capture via windows-capture.
-
-    Binds by HWND when the library can (2.0+), which makes it as exact as
-    PrintWindow. On 1.4.2 it binds by window *title*, with no way to read back the
-    HWND it bound; identity is then evidence, not proof: we require sole title
-    ownership before binding and re-verify on every frame, and any failure stops
-    capture rather than degrading quietly.
-    """
-
-    kind = Backend.WGC
-
-    def __init__(self, binding, pool, sink) -> None:
-        super().__init__(binding, pool, sink)
-        self._control = None
-        self._checked_first_frame = False
-        self.border_suppressed = False
-        self.by_hwnd = wgc_selects_by_hwnd()
-
-    def start(self) -> None:
-        if self.by_hwnd is None:
-            raise RuntimeError("windows-capture is unavailable or could not be inspected; "
-                               "not binding WGC by title on a guess")
-        self.binding.verify(require_title_ownership=not self.by_hwnd)
-        pin_graphics_capture()
-        self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
-        if not WGC_BORDER_TOGGLE_SUPPORTED:
-            log.info(
-                "WGC capture border cannot be hidden before Windows 11 "
-                "(build %d); capturing with the default border",
-                _sys.getwindowsversion().build,
-            )
-        self._control = self._open(
-            draw_border=False if WGC_BORDER_TOGGLE_SUPPORTED else None
-        )
-
-    def _open(self, *, draw_border: bool | None):
-        from windows_capture import WindowsCapture
-
-        if self.by_hwnd:
-            target = {"window_hwnd": self.binding.hwnd}
-        else:
-            target = {"window_name": self.binding.title}
-        cap = WindowsCapture(cursor_capture=False, draw_border=draw_border, **target)
-
-        @cap.event
-        def on_frame_arrived(frame, capture_control):  # noqa: ANN001
-            try:
-                if self.retired:
-                    capture_control.stop()
-                    return
-                self._on_frame(frame)
-            except IdentityLost as exc:
-                self.error = str(exc)
-                log.error("WGC identity check failed: %s", exc)
-                capture_control.stop()
-            except Exception as exc:                      # pragma: no cover
-                self.error = repr(exc)
-                log.exception("WGC frame handler failed")
-                capture_control.stop()
-
-        @cap.event
-        def on_closed():                                   # noqa: ANN001
-            log.info("WGC session closed")
-
-        return cap.start_free_threaded()
-
-    def _on_frame(self, frame) -> None:
-        array = frame.frame_buffer
-        height, width = array.shape[:2]
-
-        if not self._checked_first_frame:
-            # First frame is where a wrong binding is cheapest to catch.
-            if not self.binding.dimensions_match(width, height):
-                raise IdentityLost(
-                    f"first frame is {width}x{height}, which matches neither the "
-                    f"target's frame nor its client rect; refusing to trust this binding"
-                )
-            self._checked_first_frame = True
-
-        self.binding.verify(require_title_ownership=not self.by_hwnd)
-        self._publish(array, getattr(frame, "timespan", 0) or 0)
-
-    def stop(self) -> None:
-        self.retire()
-        ctl = self._control
-        if ctl is not None:
-            try:
-                ctl.stop()
-            except Exception:
-                log.debug("WGC stop raised", exc_info=True)
-            self._control = None
-
-
 class MssBackend(CaptureBackend):
     """Full-screen grab cropped to the window rect. Last resort.
 
@@ -755,19 +664,22 @@ def die_with_this_process(pid: int) -> bool:
         return False
 
 
-class PrintWindowBackend(CaptureBackend):
-    """PrintWindow, driven from a child process so it can be killed.
+class WorkerBackend(CaptureBackend):
+    """A capture method run in a child process, read back through shared memory.
 
-    HWND-exact: unlike WGC it addresses the window handle directly, so it is the
-    backend to use when target identity has to be certain rather than merely
-    evidenced.
+    Used for the methods that can take their process down with them: PrintWindow
+    can block forever inside the target application, and windows-capture can
+    crash natively when a session restarts. Either way the child is what is lost.
+    The parent keeps every decision about the frames -- identity, deduplication,
+    the deadline -- and kills a child that stops producing; it never waits on it.
     """
 
-    kind = Backend.PRINTWINDOW
+    #: seconds to let the child stop cleanly before it is terminated
+    stop_grace = 0.0
 
-    def __init__(self, binding, pool, sink, *, max_pixels: int = 3840 * 2160) -> None:
+    def __init__(self, binding, pool, sink, *, max_pixels: int | None = None) -> None:
         super().__init__(binding, pool, sink)
-        self._max_bytes = max_pixels * 4
+        self._max_bytes = (max_pixels or slot_pixels(binding)) * 4
         self._shm = None
         self._ctrl = None
         self._proc: mp.Process | None = None
@@ -775,59 +687,82 @@ class PrintWindowBackend(CaptureBackend):
         self._stop = threading.Event()
         self.torn_reads = 0
 
-    def start(self) -> None:
-        from multiprocessing.shared_memory import SharedMemory
+    # -- what a subclass provides --
+    def _worker(self):
+        """(target, the arguments that come before the shared slot) for the child."""
+        raise NotImplementedError
 
-        from gamelens import _pw_worker as worker
-
+    def _check(self, array: np.ndarray) -> None:
+        """Raise IdentityLost if this frame may not be published."""
         self.binding.verify(require_title_ownership=False)
 
-        self._shm = SharedMemory(create=True, size=self._max_bytes)
-        self._ctrl = mp.Array("i", worker.CTRL_SIZE, lock=False)
-        self._proc = mp.Process(
-            target=worker.run,
-            args=(self.binding.hwnd, self._shm.name, self._ctrl),
-            name="gamelens-printwindow",
-            daemon=True,
-        )
-        self._proc.start()
-        if not die_with_this_process(self._proc.pid):
-            # An unprotected worker can outlive a hard kill holding our files
-            # (RV03-I03, Codex): refuse this backend rather than run one.
-            self.stop()
-            raise RuntimeError("could not tie the printwindow worker to this process")
+    # -- lifecycle --
+    def _spawn(self) -> None:
+        from multiprocessing.shared_memory import SharedMemory
 
-        self._reader = threading.Thread(
-            target=self._read_loop, name="gamelens-pw-reader", daemon=True
-        )
-        self._reader.start()
+        # Any failure part-way leaves nothing behind: the supervisor drops a
+        # backend whose start raised without stopping it, so a worker started
+        # here and not cleaned up here would run unsupervised until exit, one
+        # more per retry (RV04-I01, Codex).
+        try:
+            self._shm = SharedMemory(create=True, size=self._max_bytes)
+            self._ctrl = mp.Array(_frame_shm.CTRL_TYPECODE, _frame_shm.CTRL_SIZE, lock=False)
+            target, args = self._worker()
+            self._proc = mp.Process(
+                target=target,
+                args=(*args, self._shm.name, self._ctrl),
+                name=f"gamelens-{self.kind.value}",
+                daemon=True,
+            )
+            self._proc.start()
+            if not die_with_this_process(self._proc.pid):
+                # An unprotected worker can outlive a hard kill holding our files
+                # (RV03-I03, Codex): refuse this backend rather than run one.
+                raise RuntimeError(
+                    f"could not tie the {self.kind.value} worker to this process")
+
+            reader = threading.Thread(
+                target=self._read_loop, name=f"gamelens-{self.kind.value}-reader", daemon=True
+            )
+            reader.start()
+            self._reader = reader                # only a started thread can be joined
+        except BaseException:
+            self.stop()
+            raise
+
+    def _exit_message(self, code: int) -> str:
+        code &= 0xFFFFFFFF
+        text = f"{self.kind.value} worker exited (code {code:#x})"
+        if code == 0xC0000005:
+            text += ": it crashed (access violation); GameLens itself is unaffected"
+        elif self.distinct == 0:
+            # Windows spawns rather than forks, so the child re-imports the
+            # parent's __main__. A caller whose entry point is not guarded by
+            # `if __name__ == "__main__":` makes that import re-run their script,
+            # and multiprocessing refuses to start. Say so, rather than letting
+            # this look like a stalled game.
+            text += ('. On Windows the child re-imports the calling module: run '
+                     'GameLens via `python -m gamelens`, or guard your entry point '
+                     'with `if __name__ == "__main__":`.')
+        return text
 
     def _read_loop(self) -> None:
-        from gamelens import _pw_worker as worker
-
         seen = 0
         while not self._stop.is_set() and not self.retired:
             try:
+                error = self._ctrl[_frame_shm.CTRL_ERROR]
+                if error:
+                    what = _frame_shm.ERROR_TEXT.get(error, f"failed ({error})")
+                    self.error = f"{self.kind.value} worker {what}"
+                    return
+
                 proc = self._proc
                 if proc is not None and not proc.is_alive() and proc.exitcode is not None:
-                    # Windows spawns rather than forks, so the child re-imports
-                    # the parent's __main__. A caller whose entry point is not
-                    # guarded by `if __name__ == "__main__":` makes that import
-                    # re-run their script, and multiprocessing refuses to start.
-                    # Say so, rather than letting this look like a stalled game.
-                    self.error = (
-                        f"printwindow worker exited immediately (code {proc.exitcode}). "
-                        f"On Windows the child re-imports the calling module: run "
-                        f"GameLens via `python -m gamelens`, or guard your entry "
-                        f"point with `if __name__ == \"__main__\":`."
-                    )
+                    self.error = self._exit_message(proc.exitcode)
+                    log.error("%s", self.error)
                     return
 
-                if self._ctrl[worker.CTRL_ERROR]:
-                    self.error = "printwindow worker reported a fatal error"
-                    return
-
-                counter = self._ctrl[worker.CTRL_COUNTER]
+                counter = self._ctrl[_frame_shm.CTRL_COUNTER]
                 if counter == seen:
                     time.sleep(0.004)
                     continue
@@ -835,19 +770,19 @@ class PrintWindowBackend(CaptureBackend):
                 snapshot = self._read_settled_frame()
                 if snapshot is None:
                     continue                      # writer was mid-frame; try again
-                array, counter = snapshot
+                array, counter, timespan = snapshot
                 seen = counter
 
-                self.binding.verify(require_title_ownership=False)
-                # No row flip. GetBitmapBits on the compatible bitmap the worker
-                # builds returns rows top-down already; the bottom-up assumption
-                # this used to make produced a perfectly stable, perfectly
-                # upside-down picture. Caught only by looking at a frame -- the
-                # frame rate, the pool counters and the identity checks were all
-                # happy with it.
-                self._publish(array, counter)
+                self._check(array)
+                # No row flip. Both workers hand over rows top-down; the
+                # bottom-up assumption PrintWindow once made produced a perfectly
+                # stable, perfectly upside-down picture. Caught only by looking at
+                # a frame -- the frame rate, the pool counters and the identity
+                # checks were all happy with it.
+                self._publish(array, timespan or counter)
             except IdentityLost as exc:
                 self.error = str(exc)
+                log.error("%s identity check failed: %s", self.kind.value, exc)
                 return
             except Exception as exc:                      # pragma: no cover
                 self.error = repr(exc)
@@ -860,17 +795,17 @@ class PrintWindowBackend(CaptureBackend):
         changes across any write. If it is odd, or it moved while we were
         copying, the bytes we have are a blend of two frames and are discarded.
         """
-        from gamelens import _pw_worker as worker
-
+        ctrl = self._ctrl
         for _ in range(attempts):
-            before = self._ctrl[worker.CTRL_VERSION]
+            before = ctrl[_frame_shm.CTRL_VERSION]
             if before % 2:
                 time.sleep(0.001)
                 continue
 
-            width = self._ctrl[worker.CTRL_WIDTH]
-            height = self._ctrl[worker.CTRL_HEIGHT]
-            counter = self._ctrl[worker.CTRL_COUNTER]
+            width = ctrl[_frame_shm.CTRL_WIDTH]
+            height = ctrl[_frame_shm.CTRL_HEIGHT]
+            counter = ctrl[_frame_shm.CTRL_COUNTER]
+            timespan = ctrl[_frame_shm.CTRL_TIMESPAN]
             if width <= 0 or height <= 0 or width * height * 4 > self._max_bytes:
                 return None
 
@@ -880,28 +815,27 @@ class PrintWindowBackend(CaptureBackend):
                 self._shm.buf[:nbytes], dtype=np.uint8
             ).reshape(height, width, 4).copy()
 
-            if self._ctrl[worker.CTRL_VERSION] == before:
-                return array, counter
+            if ctrl[_frame_shm.CTRL_VERSION] == before:
+                return array, counter, timespan
 
         self.torn_reads += 1
         return None
 
     def stop(self) -> None:
-        """Retire and kill. Never blocks on a call that may never return.
-
-        The child is terminated rather than asked politely first: the whole
-        reason it is a process is that it may be stuck inside PrintWindow, where
-        a cooperative stop flag would never be read.
-        """
+        """Retire and kill. Never blocks on a call that may never return."""
         self.retire()
         self._stop.set()
 
         proc = self._proc
         if proc is not None and proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=1.0)           # bounded; terminate already sent
+            if self.stop_grace and self._ctrl is not None:
+                self._ctrl[_frame_shm.CTRL_STOP] = 1
+                proc.join(timeout=self.stop_grace)
             if proc.is_alive():
-                proc.kill()
+                proc.terminate()
+                proc.join(timeout=1.0)           # bounded; terminate already sent
+                if proc.is_alive():
+                    proc.kill()
         self._proc = None
 
         reader = self._reader
@@ -916,6 +850,119 @@ class PrintWindowBackend(CaptureBackend):
             except Exception:
                 log.debug("shared memory cleanup raised", exc_info=True)
             self._shm = None
+
+
+# The smallest frame slot a worker gets. Only the pages a frame actually touches
+# are ever resident; the rest is address space.
+MIN_SLOT_PIXELS = 3840 * 2160
+
+
+def slot_pixels(binding) -> int:
+    """How many pixels a worker's frame slot holds for *binding*.
+
+    Sized from the target and the desktop, not a fixed 4K: WGC in-process had no
+    limit at all, and a fixed slot turned a 5K window into ERR_TOO_BIG on both
+    worker backends -- and a fall-through to mss, which can capture whatever
+    covers the window (RV04-I02, Codex). The virtual screen covers a window
+    later maximized or moved to the biggest monitor; the target's own size
+    covers one larger than any monitor.
+    """
+    pixels = max(MIN_SLOT_PIXELS, int(binding.width) * int(binding.height))
+    if _sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+            metrics = ctypes.windll.user32.GetSystemMetrics
+            pixels = max(pixels, metrics(SM_CXVIRTUALSCREEN) * metrics(SM_CYVIRTUALSCREEN))
+        except Exception:
+            log.debug("virtual screen size unavailable", exc_info=True)
+    return pixels
+
+
+class WgcBackend(WorkerBackend):
+    """Windows Graphics Capture via windows-capture, in a child process.
+
+    In a child because windows-capture can crash natively when a session
+    restarts -- 2.0.1 on Java world reloads, and 1.4.2 too, when an Enhanced
+    Session connect starved WGC and the supervisor tried it again (GL-044). That
+    crash used to end GameLens; now it ends the worker and the supervisor fails
+    over (``_wgc_worker``).
+
+    Binds by HWND when the library can (2.0+), which makes it as exact as
+    PrintWindow. On 1.4.2 it binds by window *title*, with no way to read back the
+    HWND it bound; identity is then evidence, not proof: we require sole title
+    ownership before binding and re-verify on every frame, and any failure stops
+    capture rather than degrading quietly.
+    """
+
+    kind = Backend.WGC
+    # windows-capture ends a session properly when asked; a worker that does not
+    # manage it in this long is killed like any other.
+    stop_grace = 0.5
+
+    def __init__(self, binding, pool, sink, **kw) -> None:
+        super().__init__(binding, pool, sink, **kw)
+        self._checked_first_frame = False
+        self.border_suppressed = False
+        self.by_hwnd = wgc_selects_by_hwnd()
+
+    def start(self) -> None:
+        if self.by_hwnd is None:
+            raise RuntimeError("windows-capture is unavailable or could not be inspected; "
+                               "not binding WGC by title on a guess")
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
+        self.border_suppressed = WGC_BORDER_TOGGLE_SUPPORTED
+        if not WGC_BORDER_TOGGLE_SUPPORTED:
+            log.info(
+                "WGC capture border cannot be hidden before Windows 11 "
+                "(build %d); capturing with the default border",
+                _sys.getwindowsversion().build,
+            )
+        self._spawn()
+
+    def _worker(self):
+        from gamelens import _wgc_worker
+
+        if self.by_hwnd:
+            target = {"window_hwnd": self.binding.hwnd}
+        else:
+            target = {"window_name": self.binding.title}  # 1.4.2 only: 2.x matches substrings
+        return _wgc_worker.run, (target, False if WGC_BORDER_TOGGLE_SUPPORTED else None)
+
+    def _check(self, array: np.ndarray) -> None:
+        height, width = array.shape[:2]
+        if not self._checked_first_frame:
+            # First frame is where a wrong binding is cheapest to catch.
+            if not self.binding.dimensions_match(width, height):
+                raise IdentityLost(
+                    f"first frame is {width}x{height}, which matches neither the "
+                    f"target's frame nor its client rect; refusing to trust this binding"
+                )
+            self._checked_first_frame = True
+        self.binding.verify(require_title_ownership=not self.by_hwnd)
+
+
+class PrintWindowBackend(WorkerBackend):
+    """PrintWindow, driven from a child process so it can be killed.
+
+    HWND-exact: unlike WGC it addresses the window handle directly, so it is the
+    backend to use when target identity has to be certain rather than merely
+    evidenced. Stopped by termination, never asked politely first: the whole
+    reason it is a process is that it may be stuck inside PrintWindow, where a
+    cooperative stop flag would never be read.
+    """
+
+    kind = Backend.PRINTWINDOW
+
+    def start(self) -> None:
+        self.binding.verify(require_title_ownership=False)
+        self._spawn()
+
+    def _worker(self):
+        from gamelens import _pw_worker
+
+        return _pw_worker.run, (self.binding.hwnd,)
 
 
 _BACKEND_CLASSES = {
