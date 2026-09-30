@@ -240,6 +240,17 @@ class GameLensClient:
         see_after = _flag(args, "see_after", True)
         strict = _flag(args, "strict", False)
 
+        if "anchor" in action:
+            if strict or action.get("kind") != "click":
+                raise ToolError("anchor requires a click with strict=false")
+            status, raw, _ = self.request("/state")
+            try:
+                supported = status == 200 and json.loads(raw).get("capabilities", {}).get("anchored_click") == "yellow-label-v1"
+            except (ValueError, AttributeError):
+                supported = False
+            if not supported:
+                raise ToolError("The running GameLens does not support label anchors. Restart the updated runtime; operator Arm/Go live is required again.")
+
         if self.shown is None:
             content, problem = self.frame(quality)
             text = "nothing was dispatched: you have not been shown the game yet; decide on this image"
