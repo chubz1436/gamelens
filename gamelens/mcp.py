@@ -35,16 +35,17 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from gamelens.session import agent_token_path, read_agent_token
+
 log = logging.getLogger("gamelens.mcp")
 
 SERVER_NAME = "gamelens"
-SERVER_VERSION = "0.39.0"
+SERVER_VERSION = "0.45.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 10.0
 
@@ -146,13 +147,16 @@ class GameLensClient:
         env = os.environ.get("GAMELENS_AGENT_TOKEN", "").strip()
         if env:
             return env
-        path = Path(self.token_file) if self.token_file else Path(tempfile.gettempdir()) / "ag.tok"
+        port = urllib.parse.urlsplit(self.url).port or 80
+        path = Path(self.token_file) if self.token_file else agent_token_path(port)
         try:
-            return path.read_text(encoding="utf-8").strip()
-        except OSError:
+            return read_agent_token(path)
+        except Exception:
             raise ToolError(
-                f"no agent token: set GAMELENS_AGENT_TOKEN or write it to {path} "
-                "(GameLens prints it on its console at startup)")
+                f"no agent token: session at {path} is missing or unreadable. Start python -m gamelens "
+                "--target <game> --no-agent. The operator uses Arm / Go live; "
+                "these agent tools cannot. Explicit GAMELENS_AGENT_TOKEN or "
+                "--token-file is also supported.") from None
 
     def request(self, path: str, body: dict | None = None):
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -191,6 +195,9 @@ class GameLensClient:
             return [], "frame came without an observation id"
         self.shown = obs
         meta = {"frame": _int(headers.get("X-GameLens-Frame")), "observation": obs}
+        retention = headers.get("X-GameLens-Observation-Retention")
+        if retention:
+            meta["retention_seconds"] = retention
         return [
             {"type": "image", "data": base64.b64encode(body).decode("ascii"),
              "mimeType": "image/jpeg"},
@@ -391,9 +398,13 @@ class Server:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "Call gamelens_see first, then gamelens_act. Click coordinates are "
-                    "pixels of the last image you were shown. The operator arms GameLens; "
-                    "these tools cannot."),
+                    "Call gamelens_state and gamelens_see before gamelens_act. Coordinates "
+                    "are pixels of the last shown image. Snapshots last up to 120s; strict "
+                    "actions still use the original short freshness limits. Rebind checks "
+                    "session, geometry and point pixels. A denial returns a new image: "
+                    "inspect it and decide again, never blindly retry. sent means injected, "
+                    "not proof of game effect. The operator arms/goes live; tools cannot. "
+                    "Live input uses the shared foreground mouse/keyboard."),
             })
         if method == "ping":
             return _ok(msg_id, {})
@@ -461,8 +472,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gamelens.mcp", description=__doc__.split("\n")[0])
     parser.add_argument("--url", default=os.environ.get("GAMELENS_URL", "http://127.0.0.1:8777"))
     parser.add_argument("--token-file", default=os.environ.get("GAMELENS_TOKEN_FILE"),
-                        help="file holding the AGENT token (default: GAMELENS_AGENT_TOKEN, "
-                             "else %%TEMP%%/ag.tok)")
+                        help="agent token file; default is the Windows-encrypted "
+                             "local GameLens session (GAMELENS_AGENT_TOKEN takes precedence)")
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")

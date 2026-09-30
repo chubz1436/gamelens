@@ -97,6 +97,34 @@ def later(lens, array: np.ndarray | None = None, session_id: int = 1) -> None:
 BUTTON = (125, 175)     # centre of B0, in image pixels
 
 
+@pytest.mark.parametrize("change, expected", [
+    ("none", None), ("session", "RETIRED_SESSION"),
+    ("preempt", "PREEMPTED"), ("geometry", "GEOMETRY_MOVED"),
+    ("point", "SCREEN_CHANGED"), ("strict", "original"),
+])
+def test_retained_model_turn_preserves_rebind_guards(lens, monkeypatch, change, expected):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    token = shown(lens)
+    original = lens.observations.resolve(token)
+    clock[0] += 30  # beyond the old registry's 5s, not the new retention ceiling
+    image = scene()
+    if change == "point":
+        image[170:180, 120:130, :3] = (255, 0, 255)
+    lens.capture.frames.frame = ArrFrame(2, image, 2 if change == "session" else 1)
+    if change == "preempt":
+        lens.arbiter.preempt()
+    if change == "geometry":
+        lens.geometry.move()
+    got = GameLens._bind(lens, token, "delayed", change != "strict", points=[BUTTON])
+    if expected == "original":
+        assert got[0] is original and not lens.arbiter.is_fresh(got[0])
+    elif expected:
+        assert isinstance(got, Dispatch) and got.verdict == expected
+    else:
+        assert got[1]["bound_to"] == "fresh" and got[0].frame_id == 2
+
+
 # --- when rebinding is allowed ----------------------------------------------
 
 

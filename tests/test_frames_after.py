@@ -152,7 +152,7 @@ class FrameRuntime(FakeRuntime):
     def latest_frame_id(self) -> int:
         return self.latest
 
-    def encode_frame(self, quality: int = 70, *, min_frame_id=None):
+    def encode_frame(self, quality: int = 70, *, min_frame_id=None, retain=True):
         self.encodes += 1
         if self.script:
             return self.script.pop(0)
@@ -300,7 +300,7 @@ def test_a_stream_part_names_the_frame_that_was_encoded(frt):
 
 
 class _Registry:
-    def issue(self, observation, *, jpeg=None, quality=None, moving=None) -> str:
+    def issue(self, observation, *, jpeg=None, quality=None, moving=None, retain=True) -> str:
         return "obs"
 
 

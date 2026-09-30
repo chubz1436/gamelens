@@ -125,16 +125,21 @@ def _supervisor(forced):
 
 
 def _lens(forced) -> GameLens:
+    from gamelens.app import ObservationRegistry
+    from gamelens.safety import Denial
+
     lens = object.__new__(GameLens)
     lens.capture = _supervisor(forced)
     lens._frame_ages = []
     lens.target = type("T", (), {"hwnd": 0})()
     lens.agent = None
     lens._agent_intent = ""
-    lens.safety = type("S", (), {"snapshot": lambda self: {}})()
+    lens.safety = type("S", (), {"snapshot": lambda self: {},
+                                 "check": lambda self, **kw: Denial.NOT_ARMED})()
     lens.executor = type("E", (), {"snapshot": lambda self: {}})()
     lens.arbiter = type("A", (), {"stats": lambda self: {}})()
     lens.log = type("L", (), {"marks": lambda self: [], "entries": lambda self: []})()
+    lens.observations = ObservationRegistry()
     return lens
 
 

@@ -66,6 +66,32 @@ def test_tokens_are_unguessable():
     assert all(len(t) >= 10 for t in tokens)
 
 
+def test_agent_snapshot_survives_thinking_and_a_busy_dashboard(monkeypatch):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    registry = ObservationRegistry()
+    observation = make_observation()
+    token = registry.issue(observation)
+    clock[0] += 30
+    for _ in range(1000):
+        registry.issue(make_observation(), retain=False)
+    assert registry.resolve(token) is observation
+    assert len(registry._records) == 1
+    assert len(registry._stream_records) <= 256
+    clock[0] += 91
+    assert registry.resolve(token) is None
+
+
+def test_stream_record_keeps_its_short_retention(monkeypatch):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    registry = ObservationRegistry()
+    token = registry.issue(make_observation(), retain=False)
+    assert registry.resolve(token) is not None
+    clock[0] += 6
+    assert registry.resolve(token) is None
+
+
 # --- GL-030: the transport scale must survive the round trip ---------------
 
 

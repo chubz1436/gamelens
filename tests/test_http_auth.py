@@ -106,8 +106,11 @@ def test_state_rejects_a_wrong_token(client):
 
 
 def test_state_accepts_either_token(client, runtime):
-    assert client.get("/state", headers=op(runtime)).status_code == 200
-    assert client.get("/state", headers=agent(runtime)).status_code == 200
+    operator_state = client.get("/state", headers=op(runtime))
+    agent_state = client.get("/state", headers=agent(runtime))
+    assert operator_state.status_code == agent_state.status_code == 200
+    assert operator_state.json()["role"] == "operator"
+    assert agent_state.json()["role"] == "agent"
 
 
 # --- capability separation -------------------------------------------------

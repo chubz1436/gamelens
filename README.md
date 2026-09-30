@@ -34,7 +34,7 @@ backend    : printwindow   33.0 fps      frame age 16 ms
 ```
 
 ```bash
-.venv/Scripts/python.exe -m gamelens --target "Your Game Window"
+.venv/Scripts/python.exe -m gamelens --target "Your Game Window" --no-agent
 ```
 
 GameLens prints two tokens to its console and opens on `http://127.0.0.1:8777/`. Paste the
@@ -42,6 +42,11 @@ GameLens prints two tokens to its console and opens on `http://127.0.0.1:8777/`.
 **Go live** — two separate steps, on purpose.
 
 **Kill switch: F12 or Pause.** It latches; restart the process to clear it.
+
+For Codex or Claude driving through MCP, use `--no-agent`: no separate paid vision API is
+needed. The dashboard shows the current access role, foreground state, blocked-input reason,
+executor results and snapshot retention. Only the operator can Arm, Go live or Stop.
+`sent` means input was injected; inspect the next image to confirm the game actually changed.
 
 ## Safety model
 
@@ -170,7 +175,7 @@ These are real and not worked around:
 .venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
-83 tests covering the interlocks, the arbiter's rejection rules, the coordinate transforms,
+609 tests covering the interlocks, the arbiter's rejection rules, the coordinate transforms,
 per-thread DPI, the observation registry and transport scaling, the HTTP boundary, and the
 outcome reporting that tells acceptance apart from execution.
 
@@ -234,9 +239,13 @@ instead of hand-written HTTP calls:
 | `gamelens_act` | one action, then the frame after it — **one call is act + see** |
 
 The server is `python -m gamelens.mcp`, a stdio MCP server that is an HTTP client of a running
-GameLens. It holds **the agent token only**, read on every request from `GAMELENS_AGENT_TOKEN`
-or else the file `%TEMP%\ag.tok` (or `--token-file`), so restarting GameLens only means updating
-that file. It cannot arm, go live or stop: those stay the operator's, on the dashboard.
+GameLens. It holds **the agent token only**. Capture startup automatically writes it to
+`%LOCALAPPDATA%\GameLens\agent-8777.token`, encrypted with Windows DPAPI for the current user;
+the MCP reads it on each request and derives the filename from its configured HTTP port.
+Normal capture shutdown removes its own credential. Restarting capture rotates it without
+restarting MCP. The operator token stays on the console. Explicit `GAMELENS_AGENT_TOKEN` takes
+precedence; `--token-file` still accepts a supplied plaintext token file. It cannot arm, go live
+or stop: those stay the operator's, on the dashboard.
 
 Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.codex/config.toml`:
 
@@ -245,7 +254,14 @@ Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.code
 command = "B:/AI_Agent_folder/GAME VIDEO/.venv/Scripts/python.exe"
 args = ["-m", "gamelens.mcp"]
 cwd = "B:/AI_Agent_folder/GAME VIDEO"
+startup_timeout_sec = 20
+tool_timeout_sec = 45
 ```
+
+Keep `cwd` on the updated canonical checkout containing `gamelens/mcp.py`. After adding the
+server, reload/restart it in the app's MCP settings; an already-running chat may still have its
+previous tool list. Start capture with the quick-start command, paste the console's operator
+token into the dashboard, and check state/see before acting. Never put either token in TOML.
 
 **`kind: "sequence"`** puts overlapping steps in one action, so "walk while turning" is one
 call instead of a turn after the walk has already stopped:
@@ -323,6 +339,13 @@ agent was shown, in colour (and the whole image roughly), or it answers `SCREEN_
 and the agent gets the current image to decide on again. It never retries. Residual risk,
 stated: a small change *away from* the click point that changes what the click means is not
 seen. `strict: true` turns rebinding off for a call.
+
+Agent `/frame.jpg` snapshots are retained for up to **120 seconds**, at most **16 snapshots**.
+Retention preserves the original pixels and provenance for comparison; it does not make an
+old frame fresh. The original arbiter deadlines, per-press guards and rebind checks remain.
+Dashboard MJPEG observations have a separate bounded pool (256 records, 5 seconds), so a busy
+preview cannot evict an agent's snapshot. Expired/evicted records still fail closed. A refusal
+returns a current image: inspect it and decide again; never automatically repeat an action.
 
 **Not using your mouse and keyboard.** Everything above still injects with `SendInput`, which
 is global, and still needs the game in the foreground. Whether a game accepts input posted to
