@@ -45,7 +45,7 @@ from gamelens.session import agent_token_path, read_agent_token
 log = logging.getLogger("gamelens.mcp")
 
 SERVER_NAME = "gamelens"
-SERVER_VERSION = "0.45.0"
+SERVER_VERSION = "0.46.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 10.0
 
@@ -69,6 +69,12 @@ ACTION_SCHEMA = {
         "(minus equals lbracket rbracket backslash semicolon quote comma period slash "
         "backtick, or the character). Buttons: left, right, middle, x1/mouse4, x2/mouse5. "
         "Optional on any kind: measure, settle_ms, label."
+        " Click may opt into anchor={x,y,width,height,color:'yellow'}: a visible yellow "
+        "NPC/command label from the shown image, 20-256 pixels wide and 8-48 high. "
+        "The click must be within 40 pixels of that label. GameLens verifies its glyphs "
+        "at the same position on the newest frame, allowing nearby animation without "
+        "loosening ordinary click checks. A changed/hidden label refuses; no retry. "
+        "Anchor requires strict=false. Do not use anchors for unlabeled inventory items."
     ),
     "properties": {"kind": {"type": "string",
                             "enum": ["click", "key", "press", "look", "scroll", "sequence"]}},

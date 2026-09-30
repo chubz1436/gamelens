@@ -19,6 +19,7 @@ from gamelens.capture import Backend, CaptureSupervisor
 from gamelens.coords import GeometryTracker
 from gamelens.input import InputExecutor
 from gamelens.safety import SafetySupervisor
+from gamelens.target import parse_anchor, same_at_anchor
 from gamelens.server import (
     ENCODE_FAILED, NO_FRAME, ActionLog, Encoded, Tokens, encode_jpeg,
 )
@@ -490,7 +491,7 @@ class GameLens:
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
         measure: bool = False, settle: float = CHURN_SETTLE,
-        button: str = "left", rebind: bool = False,
+        button: str = "left", rebind: bool = False, anchor: dict | None = None,
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
@@ -505,7 +506,11 @@ class GameLens:
         which is the first recipe in the game. `Arbiter.click_action` already
         took a button; nothing could reach it.
         """
-        bound = self._bind(observation_id, label, rebind, points=[(x, y)])
+        if anchor is not None:
+            anchor = parse_anchor(anchor, x, y)
+            if not rebind:
+                raise ValueError("anchor requires rebind=true")
+        bound = self._bind(observation_id, label, rebind, points=[(x, y)], anchor=anchor)
         if isinstance(bound, Dispatch):
             return bound
         observation, binding = bound
@@ -641,7 +646,7 @@ class GameLens:
         """How many new inputs one sequence may contain: the rate bucket's size."""
         return self.safety.rate_capacity
 
-    def _bind(self, observation_id: str, label: str, rebind: bool, *, points=()):
+    def _bind(self, observation_id: str, label: str, rebind: bool, *, points=(), anchor=None):
         """The observation an action runs on, and how it was chosen.
 
         Returns ``(observation, binding)`` or a denial ``Dispatch``.
@@ -665,7 +670,7 @@ class GameLens:
         shown, shown_jpeg, quality, moving = record
         if not rebind:
             return shown, None
-        if self.arbiter.is_fresh(shown):
+        if self.arbiter.is_fresh(shown) and anchor is None:
             return shown, {"bound_to": "shown"}
 
         binding: dict = {"bound_to": None, "shown_frame": shown.frame_id}
@@ -685,6 +690,18 @@ class GameLens:
                         detail = "no image on record to compare the click point against"
                     else:
                         fresh_jpeg, scale = encode_jpeg(frame.array, quality=quality or 70)
+                        if anchor is not None:
+                            same = same_at_anchor(shown_jpeg, fresh_jpeg, anchor, *points[0])
+                            binding.update(same)
+                            if scale != shown.scale:
+                                verdict = Rejection.GEOMETRY_MOVED
+                            elif not same["anchor_ok"]:
+                                detail = "the visible yellow anchor label changed; look again"
+                                self.log.add(f"{label}: {detail}", "denied")
+                                return Dispatch("TARGET_CHANGED", "denied", detail, binding=binding)
+                            else:
+                                binding["bound_to"] = "anchored"
+                                return fresh, binding
                         checks = [same_at_click(shown_jpeg, fresh_jpeg, *p, moving=moving)
                                   for p in points]
                         # The worst point speaks for all of them. A point that
@@ -939,6 +956,7 @@ class GameLens:
             },
             "safety": safety,
             "session": session,
+            "capabilities": {"anchored_click": "yellow-label-v1", "shared_input": True},
             "observations": {"retention_seconds": self.observations.retention_seconds,
                              "snapshot_capacity": self.observations._capacity,
                              "stream_retention_seconds": 5.0},

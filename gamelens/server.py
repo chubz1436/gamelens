@@ -24,6 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from gamelens.arbiter import _scroll_clicks, parse_sequence
+from gamelens.target import parse_anchor
 
 log = logging.getLogger(__name__)
 
@@ -517,6 +518,10 @@ def create_app(runtime) -> FastAPI:
                 raise ValueError("rebind must be true or false")
             if rebind:
                 call["rebind"] = True
+            if "anchor" in body:
+                if kind != "click" or not rebind:
+                    raise ValueError("anchor is only supported for click with rebind=true")
+                call["anchor"] = parse_anchor(body["anchor"], call["x"], call["y"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError is in the list because JSON has no float limit: an
             # integer literal with four hundred zeros is valid JSON and a valid

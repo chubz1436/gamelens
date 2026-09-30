@@ -189,6 +189,7 @@ def test_a_held_button_is_released_too(live, monkeypatch):
     sup, ex = live
     rec = Recorder()
     monkeypatch.setattr(gl_input, "_send", rec)
+    monkeypatch.setattr(gl_input, "cursor_position", lambda: (10, 10))
 
     settled = threading.Event()
     ex.submit(Sequence(

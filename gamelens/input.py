@@ -724,6 +724,7 @@ class InputExecutor:
         the operator's.
         """
         injected = False
+        expected_pointer = None
         if self.unreleased:
             # One more attempt before refusing: the failure may have been
             # transient. Outside every boundary, as release_all requires.
@@ -760,7 +761,15 @@ class InputExecutor:
                     log.info("[dry-run] %s %s", seq.label, step)
                 else:
                     self._guard_input(step)
+                    if isinstance(step, ButtonDown) and expected_pointer is not None:
+                        here = cursor_position()
+                        if here is None or max(abs(here[i]-expected_pointer[i]) for i in (0, 1)) > 2:
+                            raise NotPermitted(Denial.POINTER_MOVED)
                     self._apply_new(step)
+                    if isinstance(step, MoveTo):
+                        expected_pointer = (step.x, step.y)
+                    elif isinstance(step, LookBy):
+                        expected_pointer = None
                     injected = True
 
         return "sent" if injected else "dry"

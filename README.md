@@ -355,6 +355,30 @@ so on a shared desktop it fights the Owner either way. The durable answer is a s
 machine or VM (`tools/vm/new-test-vm.ps1`). `tools/bg_input_probe.py` is a Minecraft
 Java-only experiment on the same question.
 
+### Animated NPCs and translucent menus
+
+Ordinary clicks retain the exact pixel-patch check. For a target with a visible yellow
+name or command label, an agent can explicitly provide a small fixed-position anchor:
+
+```json
+{"kind":"click","x":583,"y":322,"rebind":true,
+ "anchor":{"x":535,"y":288,"width":125,"height":16,"color":"yellow"}}
+```
+
+Coordinates refer to the issued image. The label must be 20–256 pixels wide, 8–48 high,
+and within 40 pixels of the click. GameLens verifies identifying yellow glyphs from the
+stored image against a fresh frame at that same location. Nearby animation may change;
+a changed, hidden, moved or uninformative label refuses with `TARGET_CHANGED`. No searching,
+automatic retry or threshold override. MCP passes `anchor` inside `action` with `strict:false`.
+Use ordinary clicks for inventory items and targets without such a label.
+
+Target/session/geometry/preemption, foreground, pointer occlusion, watchdog, rate and kill
+guards remain. If the human moves the cursor during an agent click's settle time, the
+executor refuses the press even when the cursor is still inside the game. Reobserve before
+resuming. A video covering the destination also refuses; GameLens never steals focus to
+continue. This improves target verification, not desktop isolation: simultaneous Owner
+mouse/keyboard use requires the game and GameLens in a separate PC/guest Windows session.
+
 ## Provenance
 
 The plan was hardened through five rounds of independent Codex review, then the finished

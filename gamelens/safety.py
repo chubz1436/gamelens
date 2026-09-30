@@ -47,6 +47,7 @@ class Denial(Enum):
     # Checked by the executor at each press rather than by check(): they are
     # about the input about to be sent, which check() never sees (GL-040).
     POINTER_OFF_TARGET = "the cursor is not over the target window"
+    POINTER_MOVED = "mouse moved after agent positioning; look again before resuming"
     FOREIGN_MODIFIER = "a modifier GameLens did not press is held down"
     UNRELEASED_INPUT = "an earlier release failed; input may still be held"
 

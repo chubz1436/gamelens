@@ -170,6 +170,7 @@ def test_a_live_sequence_reports_sent(executor, sup, monkeypatch):
     """
     sent: list = []
     monkeypatch.setattr("gamelens.input._send", lambda events: sent.append(events))
+    monkeypatch.setattr("gamelens.input.cursor_position", lambda: (10, 10))
     sup.arm()
     sup.go_live()
     seen = Collector()
