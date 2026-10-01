@@ -9,11 +9,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 
-@pytest.mark.parametrize("repair,matching,custom", [
-    (False, False, False), (True, False, False),
-    (False, True, False), (True, False, True),
+@pytest.mark.parametrize("repair,matching,custom,omit_client", [
+    (False, False, False, False), (True, False, False, False),
+    (False, True, False, False), (True, False, True, False),
+    (True, False, False, True),
 ])
-def test_existing_registration_requires_review_and_preserves_client_config(tmp_path, repair, matching, custom):
+def test_existing_registration_requires_review_and_preserves_client_config(tmp_path, repair, matching, custom, omit_client):
     shell = shutil.which("powershell") or shutil.which("pwsh")
     if not shell:
         pytest.skip("PowerShell required")
@@ -49,7 +50,7 @@ def test_existing_registration_requires_review_and_preserves_client_config(tmp_p
     output = tmp_path / "result.json"
     harness = tmp_path / "harness.ps1"
     harness.write_text(r"""
-param($Installer, $Config, $Output, $Repair)
+param($Installer, $Config, $Output, $Repair, $OmitClient)
 $global:Registration = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
 $global:AddCount = 0
 function global:codex {
@@ -57,6 +58,9 @@ function global:codex {
     $global:LASTEXITCODE = 0
     if ($a[0] -eq 'plugin') { return '{}' }
     if ($a[0] -eq 'mcp' -and $a[1] -eq 'get') {
+        if ($OmitClient -eq 'yes' -and $global:AddCount -gt 0) {
+            $global:Registration.transport.env.PSObject.Properties.Remove('GAMELENS_CLIENTS_FILE')
+        }
         return ($global:Registration | ConvertTo-Json -Depth 12 -Compress)
     }
     if ($a[0] -eq 'mcp' -and $a[1] -eq 'add') {
@@ -64,7 +68,7 @@ function global:codex {
         $envMap = @{}
         $i = 3
         while ($a[$i] -eq '--env') {
-            $pair = ([string]$a[$i+1]).Split(@('='), 2)
+            $pair = ([string]$a[$i+1]) -split '=', 2
             $envMap[$pair[0]] = $pair[1]
             $i += 2
         }
@@ -87,13 +91,17 @@ try {
     ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Output -Encoding UTF8
 """, encoding="utf-8")
     result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(harness),
-                             str(script), str(config), str(output), "yes" if repair else "no"],
+                             str(script), str(config), str(output), "yes" if repair else "no",
+                             "yes" if omit_client else "no"],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     report = json.loads(output.read_text(encoding="utf-8-sig"))
     if custom or (not repair and not matching):
         assert not report["ok"] and report["adds"] == 0
         assert report["registration"] == registration
+    elif omit_client:
+        assert not report["ok"] and report["adds"] == 1
+        assert "environment read-back did not match" in report["error"]
     else:
         assert report["ok"], report["error"]
         assert report["adds"] == (0 if matching else 1)

@@ -94,6 +94,16 @@ if ($needsUpdate) {
         ([string]$verified.transport.env.GAMELENS_PROJECT_DIR).Replace('\', '/') -ne $expectedProject) {
         throw 'MCP registration read-back did not match; do not assume setup completed.'
     }
+    $verifiedEnv = @($verified.transport.env.PSObject.Properties)
+    if ($verifiedEnv.Count -ne $environment.Count) {
+        throw 'MCP environment read-back did not match; do not assume setup completed.'
+    }
+    foreach ($key in $environment.Keys) {
+        $property = $verified.transport.env.PSObject.Properties[$key]
+        if ($null -eq $property -or [string]$property.Value -cne [string]$environment[$key]) {
+            throw 'MCP environment read-back did not match; do not assume setup completed.'
+        }
+    }
 }
 Write-Output 'Installed. Reload Codex to load the new plugin tools and skills.'
 Write-Output 'Authorized agents may use gamelens_session arm/live/stop; no game/race starts on installation.'

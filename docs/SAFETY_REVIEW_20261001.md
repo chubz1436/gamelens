@@ -37,3 +37,17 @@ driver stability, full game play, or delivery of every input.
 
 Do not merge or publish a release from an untested branch. The owner requested
 notification when authoring finishes before the Codex testing phase begins.
+
+## First validation and corrections
+
+The initial ee4f9c8 validation reported 535 passed, 1 failed, zero skipped and
+three intentionally deselected tests. Compilation and PowerShell parsing passed.
+The remaining test failure was the fake CLI's Windows PowerShell 5.1 Split
+overload. Additional review found queue-capacity-one concurrent shutdown failure
+and incomplete named-client environment read-back validation.
+
+Corrections use PowerShell's -split operator, verify every proposed environment
+entry and its count, and use out-of-band cancellation plus bounded queue polling
+instead of shutdown sentinels. This also addresses the pre-existing kill/drain
+sentinel race. Added explicit regression coverage. These corrections require a
+new validation run; the earlier pass count does not validate this revision.

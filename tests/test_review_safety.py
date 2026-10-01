@@ -103,3 +103,52 @@ def test_full_queue_refuses_without_waiting_and_reports_once():
 def test_queue_capacity_is_validated(capacity):
     with pytest.raises(ValueError):
         InputExecutor(fake_safety(), queue_capacity=capacity)
+
+
+def test_concurrent_shutdown_with_capacity_one_never_enqueues_a_sentinel():
+    import threading
+    executor = InputExecutor(fake_safety(), queue_capacity=1)
+    assert executor.submit(Sequence([]))
+    joined = threading.Barrier(2)
+    executor._thread = SimpleNamespace(join=lambda timeout: joined.wait(timeout=2))
+    errors = []
+
+    def shutdown():
+        try:
+            executor.shutdown()
+        except Exception as exc:
+            errors.append(exc)
+
+    callers = [threading.Thread(target=shutdown) for _ in range(2)]
+    for thread in callers:
+        thread.start()
+    for thread in callers:
+        thread.join(timeout=3)
+    assert not any(thread.is_alive() for thread in callers)
+    assert errors == []
+    assert executor._queue.empty()
+
+
+def test_kill_stops_idle_worker_without_shutdown_sentinel(monkeypatch):
+    import threading
+    import gamelens.input as module
+    monkeypatch.setattr(module, "require_trustworthy_dpi", lambda: None)
+    executor = InputExecutor(fake_safety(), queue_capacity=1)
+    entered = threading.Event()
+    original_get = executor._queue.get
+
+    def observed_get(*args, **kwargs):
+        entered.set()
+        return original_get(*args, **kwargs)
+
+    monkeypatch.setattr(executor._queue, "get", observed_get)
+    thread = threading.Thread(target=executor._run, daemon=True)
+    executor._thread = thread
+    thread.start()
+    try:
+        assert entered.wait(timeout=2)
+        executor._on_kill("test")
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    finally:
+        executor.shutdown()

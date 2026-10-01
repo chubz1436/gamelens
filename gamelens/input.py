@@ -555,7 +555,6 @@ class InputExecutor:
         with self._admission:
             self._cancel.set()
         self._drain("shutdown")
-        self._queue.put_nowait(None)
         t = self._thread
         if t:
             t.join(timeout=2.0)
@@ -717,7 +716,14 @@ class InputExecutor:
             return
 
         while True:
-            seq = self._queue.get()
+            # Cancellation is out-of-band: kill cannot consume a shutdown
+            # sentinel, and concurrent shutdowns never compete for queue space.
+            if self._cancel.is_set():
+                return
+            try:
+                seq = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if seq is None:
                 return
             if self._cancel.is_set():
