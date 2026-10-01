@@ -618,7 +618,7 @@ def test_a_truncated_act_answer_is_reported_as_possibly_sent(monkeypatch):
     monkeypatch.setenv("GAMELENS_AGENT_TOKEN", "t")
     c = GameLensClient("http://127.0.0.1:1", None)
     c.shown = "obs"
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _Truncated())
+    monkeypatch.setattr(c.opener, "open", lambda req, timeout: _Truncated())
     content, is_error = c.tool_act({"action": {"kind": "key", "key": "w"}})
     text = "\n".join(i["text"] for i in content if i["type"] == "text")
     assert is_error is True and "MAY HAVE BEEN CARRIED OUT" in text
@@ -639,7 +639,7 @@ def test_a_truncated_picture_after_a_sent_action_keeps_the_action_result(monkeyp
         def read(self):
             return json.dumps({"verdict": "ok", "outcome": "sent", "after_frame": 7}).encode()
 
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(c.opener, "open",
                         lambda req, timeout: Ok() if req.full_url.endswith("/act") else _Truncated())
     content, is_error = c.tool_act({"action": {"kind": "key", "key": "w"}})
     text = "\n".join(i["text"] for i in content if i["type"] == "text")

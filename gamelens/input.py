@@ -451,16 +451,23 @@ class Outcome:
     detail: str = ""
     action_id: int | None = None
     label: str = ""
+    completed_steps: int = 0
+    injected_steps: int = 0
+    last_completed_step: int | None = None
+    partial: bool = False
 
     @property
     def reached_the_target(self) -> bool:
-        return self.status == "sent"
+        return self.status == "sent" or self.injected_steps > 0
 
 
 @dataclass
 class Sequence:
     steps: list[Step]
     label: str = ""
+    completed_steps: int = field(default=0, init=False)
+    injected_steps: int = field(default=0, init=False)
+    last_completed_step: int | None = field(default=None, init=False)
     # Optional provenance, carried through for the arbiter and the action log.
     meta: dict = field(default_factory=dict)
     # Called exactly once with an Outcome when this sequence is finally
@@ -497,6 +504,7 @@ class InputExecutor:
         *,
         move_settle: float = 0.12,
         press_hold: float = 0.06,
+        queue_capacity: int = 32,
     ) -> None:
         """
         ``move_settle`` is the pause between arriving at a point and pressing;
@@ -513,7 +521,10 @@ class InputExecutor:
         self._safety = safety
         self._move_settle = move_settle
         self._press_hold = press_hold
-        self._queue: queue.Queue[Sequence | None] = queue.Queue()
+        if isinstance(queue_capacity, bool) or not isinstance(queue_capacity, int) or queue_capacity < 1:
+            raise ValueError("queue_capacity must be a positive integer")
+        self._queue: queue.Queue[Sequence | None] = queue.Queue(maxsize=queue_capacity)
+        self._admission = threading.Lock()
         self._pressed_buttons: set[Button] = set()
         self._pressed_keys: set[int] = set()
         self._lock = threading.Lock()
@@ -541,8 +552,9 @@ class InputExecutor:
         self._thread.start()
 
     def shutdown(self) -> None:
-        self._cancel.set()
-        self._queue.put(None)
+        with self._admission:
+            self._cancel.set()
+        self._drain("shutdown")
         t = self._thread
         if t:
             t.join(timeout=2.0)
@@ -552,11 +564,24 @@ class InputExecutor:
         self._drain("shutdown")
         self.release_all("shutdown")
 
-    def submit(self, seq: Sequence) -> None:
-        self._queue.put(seq)
+    def submit(self, seq: Sequence) -> bool:
+        # Never wait behind a full queue; callers need an immediate honest result.
+        with self._admission:
+            if self._cancel.is_set():
+                reason = "executor is cancelled"
+            else:
+                try:
+                    self._queue.put_nowait(seq)
+                    return True
+                except queue.Full:
+                    reason = "input queue is full; nothing was queued"
+        self.cancelled += 1
+        self._report(seq, "cancelled", reason)
+        return False
 
     def _on_kill(self, reason: str) -> None:
-        self._cancel.set()
+        with self._admission:
+            self._cancel.set()
         self._drain(f"kill: {reason}")
         self.release_all(f"kill: {reason}")
 
@@ -576,10 +601,17 @@ class InputExecutor:
         callback = seq.on_outcome
         if callback is None:
             return
+        partial = seq.injected_steps > 0 and status != "sent"
+        if partial:
+            detail = f"PARTIAL INPUT: {seq.injected_steps} input steps were sent; do not replay the sequence. {detail}"
         try:
             callback(Outcome(
                 status=status,
                 detail=detail,
+                completed_steps=seq.completed_steps,
+                injected_steps=seq.injected_steps,
+                last_completed_step=seq.last_completed_step,
+                partial=partial,
                 action_id=seq.meta.get("action_id"),
                 label=seq.label,
             ))
@@ -684,7 +716,14 @@ class InputExecutor:
             return
 
         while True:
-            seq = self._queue.get()
+            # Cancellation is out-of-band: kill cannot consume a shutdown
+            # sentinel, and concurrent shutdowns never compete for queue space.
+            if self._cancel.is_set():
+                return
+            try:
+                seq = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if seq is None:
                 return
             if self._cancel.is_set():
@@ -729,7 +768,9 @@ class InputExecutor:
             # One more attempt before refusing: the failure may have been
             # transient. Outside every boundary, as release_all requires.
             self.release_all("retrying a failed release before new input")
-        for step in seq.steps:
+        seq.completed_steps = seq.injected_steps = 0
+        seq.last_completed_step = None
+        for index, step in enumerate(seq.steps):
             if self._cancel.is_set():
                 raise NotPermitted(Denial.KILLED, "cancelled mid-sequence")
 
@@ -740,10 +781,14 @@ class InputExecutor:
                 # the click it was waiting to make.
                 if self._cancel.wait(step.seconds):
                     raise NotPermitted(Denial.KILLED, "killed during dwell")
+                seq.completed_steps = index + 1
+                seq.last_completed_step = index
                 continue
 
             if isinstance(step, _RELEASE_STEPS):
                 self._release_step(step, seq.label)
+                seq.completed_steps = index + 1
+                seq.last_completed_step = index
                 continue
 
             # Every *new* injected action -- movement included. Moving the cursor
@@ -766,11 +811,14 @@ class InputExecutor:
                         if here is None or max(abs(here[i]-expected_pointer[i]) for i in (0, 1)) > 2:
                             raise NotPermitted(Denial.POINTER_MOVED)
                     self._apply_new(step)
+                    seq.injected_steps += 1
                     if isinstance(step, MoveTo):
                         expected_pointer = (step.x, step.y)
                     elif isinstance(step, LookBy):
                         expected_pointer = None
                     injected = True
+                seq.completed_steps = index + 1
+                seq.last_completed_step = index
 
         return "sent" if injected else "dry"
 
@@ -854,4 +902,5 @@ class InputExecutor:
                 "unreleased": sorted(self.unreleased),
                 "dpi_error": self._dpi_error,
                 "queue_depth": self._queue.qsize(),
+                "queue_capacity": self._queue.maxsize,
             }

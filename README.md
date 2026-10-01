@@ -68,8 +68,11 @@ companion adds the learned workflow without a second MCP connection.
 
 Install starts no capture, input or race. Open GameLens and select the game;
 Owner-authorized agents can Arm/Go live with `gamelens_session`. Plugins require this Windows project and `.venv`.
-Rerun the installer after moving the project. Existing standalone MCP setups
-remain usable; keep only one enabled connection for this same GameLens server.
+Rerun the installer after moving the project. It compares the existing standalone
+registration with the current paths and stops on a mismatch. Review the proposed
+paths, then pass `-RepairRegistration` to explicitly update a recognized stdio
+registration. Custom environments require manual review; named-client configuration
+is preserved and must still exist. Keep only one enabled connection for this server.
 
 Sharing the repository for GodsArena Marathon use? Follow the
 [setup and profile-matching guide](docs/SHARED_MARATHON_SETUP.md). Best verified
@@ -196,8 +199,8 @@ These were open questions during the build. They are answered, not deferred.
   away the boundary. An elevated injector can drive UAC prompts, security dialogs and every
   other window on the desktop, so a coordinate bug stops being a misclick in a game. The
   current behaviour is a `SendInput` short count, which fails closed and says exactly why.
-- **The session tokens stay on the console.** Two secrets, printed once, for one operator on
-  one machine, over loopback. Anything that makes them reachable from another device needs a
+- **Session credentials stay local.** Tokens are printed for the local operator and have
+  separate Windows-encrypted handoff files. MCP uses only the agent capability. Anything that makes them reachable from another device needs a
   transport that is actually authenticated, not a longer token — so that is the change to make
   if it is ever wanted, rather than widening this.
 - **The buffer pool depth stays at 4.** Measured rather than assumed: four concurrent clients
@@ -320,9 +323,12 @@ GameLens. It holds **the agent token only**. Capture startup automatically write
 `%LOCALAPPDATA%\GameLens\agent-8777.token`, encrypted with Windows DPAPI for the current user;
 the MCP reads it on each request and derives the filename from its configured HTTP port.
 Normal capture shutdown removes its own credential. Restarting capture rotates it without
-restarting MCP. The operator token stays on the console. Explicit `GAMELENS_AGENT_TOKEN` takes
-precedence; `--token-file` still accepts a supplied plaintext token file. It cannot arm, go live
-or stop: those stay the operator's, on the dashboard.
+restarting MCP. The operator token has a separate Windows-encrypted desktop handoff and is never
+used by the MCP client. Explicit `GAMELENS_AGENT_TOKEN` takes precedence;
+`--token-file` still accepts a supplied plaintext agent token file. Authenticated
+agents may explicitly Arm, Go live and Stop for an owner-authorized task; see
+[session controls](docs/AGENT_SESSION.md). The token alone does not establish the
+owner's authorization for a task.
 
 Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.codex/config.toml`:
 
@@ -465,3 +471,26 @@ thirty-three are fixed. Several were confirmed by reading the installed dependen
 by running the code rather than taken on faith — including the missing HWND selector, the
 duplicate frame delivery, and a buffer-lease leak that emptied the frame pool after four
 clicks.
+
+## Safety review follow-through (October 1, 2026)
+
+- Runtime shutdown latches Stop and releases held input before waiting for video
+  finalization. A shutdown cannot be resumed by Arm/Live.
+- Both MCP transports validate literal-loopback origins and refuse proxies and
+  redirects. No credential is forwarded to another port/origin.
+- Action responses include `completed_steps`, `injected_steps`,
+  `last_completed_step` (zero-based) and `partial`. A denied/error result with
+  `partial: true` means earlier input already reached the injector: inspect the
+  game, never replay the entire sequence. Counts describe confirmed new-input
+  sends, not proof of the game's response; a native send failure can still be
+  ambiguous. Pending results have unknown counts, not a claimed zero.
+- The executor admits at most 32 queued sequences by default and refuses excess
+  submissions immediately. This bounds backlog; existing freshness and safety
+  checks remain in force.
+- `.github/workflows/windows-safety.yml` runs isolated safety/transport tests on
+  Windows for pull requests or manual dispatch. It never launches a game or
+  proves live gameplay, driver stability, or complete desktop acceptance.
+
+These review changes were authored statically. Before merge, run the focused
+regressions, existing suite and an owner-authorized disposable-window acceptance
+test. Do not describe an unexecuted test as passing.
