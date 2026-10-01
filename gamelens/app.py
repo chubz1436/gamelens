@@ -116,6 +116,10 @@ class Dispatch:
     # observation it ran on, and for a click the patch scores that allowed it
     # or refused it. None when rebinding was not asked for.
     binding: dict | None = None
+    completed_steps: int | None = None
+    injected_steps: int | None = None
+    last_completed_step: int | None = None
+    partial: bool = False
 
     @property
     def ok(self) -> bool:
@@ -139,6 +143,10 @@ class Dispatch:
             "outcome": self.outcome,
             "detail": self.detail,
             "action_id": self.action_id,
+            "completed_steps": self.completed_steps,
+            "injected_steps": self.injected_steps,
+            "last_completed_step": self.last_completed_step,
+            "partial": self.partial,
             "churn": self.churn,
             "after_frame": self.after_frame,
             **(self.binding or {}),
@@ -351,6 +359,8 @@ class GameLens:
         log.info("GameLens ready on %r (hwnd %d)", self.target.title, self.target.hwnd)
 
     def stop(self) -> None:
+        # Stop/release input before recorder finalization or thread joins can wait.
+        self.safety.kill("runtime shutdown")
         recorder = getattr(self, "recorder", None)
         if recorder is not None:
             try:
@@ -846,13 +856,17 @@ class GameLens:
         outcome = box[0] if box else None
         # 0 means nothing had been published yet: there is no frame to wait
         # past, and reporting 0 would make "any frame at all" look like "after".
-        injected = (outcome is not None and outcome.status == "sent"
+        injected = (outcome is not None and (outcome.status == "sent" or getattr(outcome, "injected_steps", 0) > 0)
                     and bool(marks) and marks[0] > 0)
         return Dispatch(
             "ok",
             outcome.status if outcome else "pending",
             outcome.detail if outcome else "",
             action.action_id,
+            completed_steps=getattr(outcome, "completed_steps", None),
+            injected_steps=getattr(outcome, "injected_steps", None),
+            last_completed_step=getattr(outcome, "last_completed_step", None),
+            partial=getattr(outcome, "partial", False),
             churn=self._churn_since(before, outcome, settle),
             after_frame=marks[0] if injected else None,
             binding=binding,

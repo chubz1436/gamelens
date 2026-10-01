@@ -2,9 +2,9 @@
 
 Binding to 127.0.0.1 is not an access control. Every process on the machine can
 reach loopback, and so can any web page the operator happens to open, which is
-why `Origin` and `Host` are checked and why the dashboard is served without a
-credential in it. Two capabilities, two tokens: the operator can arm and go
-live; an agent can only propose actions.
+why `Origin` and `Host` are checked and why the dashboard has no embedded
+credential. Both authenticated roles can explicitly Arm/Live/Stop for an
+owner-authorized task; window enumeration and desktop handoff remain separate.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ ENCODE_FAILED = _Outcome("ENCODE_FAILED")
 
 
 class Tokens:
-    """Two capabilities. The agent's credential can never arm the system."""
+    """Separate credentials; session controls accept either authenticated role."""
 
     def __init__(self) -> None:
         self.operator = secrets.token_urlsafe(24)
@@ -98,7 +98,7 @@ class Tokens:
             "\n"
             "  operator token (arm / go live / stop, paste into the dashboard):\n"
             "    %s\n"
-            "  agent token (submit actions only):\n"
+            "  agent token (observations, actions and authorized session controls):\n"
             "    %s\n"
             "\n"
             "  The dashboard is served without a token in it, so anything else on\n"

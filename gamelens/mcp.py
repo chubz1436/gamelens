@@ -41,6 +41,7 @@ import urllib.request
 from pathlib import Path
 
 from gamelens.session import agent_token_path, read_agent_token
+from gamelens.transport import local_opener, validate_url
 
 log = logging.getLogger("gamelens.mcp")
 
@@ -181,7 +182,8 @@ class ToolError(Exception):
 
 class GameLensClient:
     def __init__(self, url: str, token_file: str | None) -> None:
-        self.url = url.rstrip("/")
+        self.url = validate_url(url)
+        self.opener = local_opener()
         self.token_file = token_file
         # The observation of the last image this server returned to the agent.
         # Replaced only by an image actually handed over, never by one fetched
@@ -217,7 +219,7 @@ class GameLensClient:
         # escaping as a bare exception it would lose the "may have been sent"
         # handling of an /act and the kept result of a later picture (GL040-RV01).
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
                 return resp.status, resp.read(), resp.headers
         except urllib.error.HTTPError as exc:
             try:
@@ -609,7 +611,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    Server(GameLensClient(args.url, args.token_file)).serve(sys.stdin.buffer, sys.stdout.buffer)
+    try:
+        client = GameLensClient(args.url, args.token_file)
+    except ValueError:
+        print("Invalid GameLens URL: use a literal-loopback HTTP origin with an explicit port", file=sys.stderr)
+        return 2
+    Server(client).serve(sys.stdin.buffer, sys.stdout.buffer)
     return 0
 
 

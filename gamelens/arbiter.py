@@ -101,6 +101,7 @@ class Rejection(Enum):
     EXPIRED = "action exceeded its time to live"
     PREEMPTED = "a faster tier acted after this was observed"
     NO_FRAME = "no frame is available"
+    QUEUE_UNAVAILABLE = "input queue is full or executor is cancelled"
     OUT_OF_BOUNDS = "coordinate falls outside the target window"
 
 
@@ -376,7 +377,7 @@ class Arbiter:
                 self.rejections[verdict.name] = self.rejections.get(verdict.name, 0) + 1
                 raise ActionRejected(verdict, f"at execution of action {action.action_id}")
 
-        self._executor.submit(Sequence(
+        queued = self._executor.submit(Sequence(
             steps=action.steps,
             label=f"{action.source}:{action.label}",
             meta={
@@ -387,6 +388,10 @@ class Arbiter:
             validate=revalidate,
             on_outcome=on_outcome,
         ))
+        if queued is False:
+            self.rejected += 1
+            self.rejections[Rejection.QUEUE_UNAVAILABLE.name] = self.rejections.get(Rejection.QUEUE_UNAVAILABLE.name, 0) + 1
+            return Rejection.QUEUE_UNAVAILABLE
         self.accepted += 1
         return Rejection.OK
 

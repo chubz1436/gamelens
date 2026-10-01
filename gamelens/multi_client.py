@@ -7,16 +7,13 @@ existing encrypted agent session file, never the legacy shared environment token
 from __future__ import annotations
 
 import json
-import http.client
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from gamelens.mcp import GameLensClient, HTTP_TIMEOUT, ToolError
+from gamelens.mcp import GameLensClient, ToolError
 from gamelens.session import agent_token_path, read_agent_token
+from gamelens.transport import validate_url
 
 MAX_CLIENTS = 16
 MAX_CONFIG_BYTES = 65536
@@ -70,19 +67,10 @@ def load_clients(path: str | Path) -> tuple[ClientSpec, ...]:
         if not isinstance(url, str):
             raise ConfigError("Client URL must be an HTTP literal-loopback URL with an explicit port")
         try:
-            parsed = urlsplit(url)
-            port = parsed.port
+            canonical = validate_url(url)
         except ValueError:
-            raise ConfigError("Invalid client URL") from None
-        if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "::1")
-                or parsed.username is not None or parsed.password is not None
-                or port is None or not 1 <= port <= 65535
-                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
-            raise ConfigError("Client URL must be http://127.0.0.1:PORT or http://[::1]:PORT without credentials, paths or queries")
-        host = "[::1]" if parsed.hostname == "::1" else "127.0.0.1"
-        canonical = f"http://{host}:{port}"
-        if url not in (canonical, canonical + "/"):
-            raise ConfigError("Client URL must use the canonical literal-loopback form")
+            raise ConfigError("Client URL must use canonical literal-loopback HTTP form with an explicit port") from None
+        port = int(canonical.rsplit(":", 1)[1])
         # Session token paths are keyed by port, even across address families.
         if name in names or port in ports:
             raise ConfigError("Client names and ports must be unique")
@@ -92,20 +80,12 @@ def load_clients(path: str | Path) -> tuple[ClientSpec, ...]:
     return tuple(specs)
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 class PortSessionClient(GameLensClient):
     """Reuse HTTP/actions/binding; keep credentials local to this client's port."""
 
     def __init__(self, spec: ClientSpec):
         super().__init__(spec.url, None)
         self.port = spec.port
-        # Never forward this port's credential to a redirected client/host, nor
-        # route it through a process-wide proxy. Opener is owned by this client.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def token(self) -> str:
         try:
@@ -113,27 +93,6 @@ class PortSessionClient(GameLensClient):
         except Exception:
             raise ToolError(f"No readable agent session for selected client port {self.port}; start its desktop session. Multi-client mode ignores shared token environment variables.") from None
 
-    def request(self, path: str, body: dict | None = None):
-        """Same bounded HTTP semantics as legacy MCP, with no origin escapes.
-
-        Keep transport exceptions chained: inherited tool_act uses that cause
-        to distinguish an unknown outcome from an action proven not to arrive.
-        No input authorization/arbiter guards are replicated here.
-        """
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(self.url + path, data=data,
-            method="POST" if data is not None else "GET",
-            headers={"X-GameLens-Token": self.token(), "Content-Type": "application/json"})
-        try:
-            with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
-                return resp.status, resp.read(), resp.headers
-        except urllib.error.HTTPError as exc:
-            try:
-                return exc.code, exc.read(), exc.headers
-            except (http.client.HTTPException, OSError) as inner:
-                raise ToolError(f"GameLens answered HTTP {exc.code} but the body was lost: {inner!r}") from inner
-        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
-            raise ToolError(f"GameLens is not reachable at {self.url}: {exc!r}") from exc
 
 
 class MultiClient:
