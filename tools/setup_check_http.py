@@ -17,10 +17,19 @@ MAX_BODY = 128 * 1024
 READ_CHUNK = 4096
 MAX_DEPTH = 32
 MAX_TOKEN = 4096
+FAILURE_CODES = frozenset((
+    "HTTP_DEADLINE_EXCEEDED", "HTTP_IO_FAILED", "HTTP_PREMATURE_EOF",
+    "HTTP_FRAMING_UNSUPPORTED", "HTTP_CONNECT_FAILED", "HTTP_REQUEST_WRITE_FAILED",
+    "HTTP_HEADERS_TOO_LARGE", "HTTP_BODY_TOO_LARGE", "HTTP_CONTENT_TYPE_UNSUPPORTED",
+    "HTTP_REDIRECT_REFUSED", "HTTP_AUTH_REJECTED", "HTTP_FORBIDDEN", "HTTP_STATUS_REJECTED",
+    "STATE_JSON_INVALID", "STATE_SCHEMA_UNSUPPORTED", "SESSION_TOKEN_INVALID",
+    "HTTP_PROBE_FAILED", "HTTP_CLOSE_FAILED",
+))
 
 
 class ProbeFailure(Exception):
-    pass
+    def __init__(self, reason):
+        super().__init__(reason if reason in FAILURE_CODES else "HTTP_PROBE_FAILED")
 
 
 class Limits:
@@ -65,6 +74,26 @@ def _integer(value):
     return int(value)
 
 
+def _float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("JSON_INVALID")
+    return result
+
+
+def check_depth(value):
+    """Bound the parsed container depth for JSON and explicitly selected TOML."""
+    pending = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, (dict, list)):
+            if depth > MAX_DEPTH:
+                raise ValueError("CONFIG_DEPTH_UNSUPPORTED")
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+    return value
+
+
 def strict_json(raw):
     """Bound nesting before parsing; reject duplicate keys and non-JSON numbers."""
     text = raw.decode("utf-8-sig")
@@ -85,8 +114,8 @@ def strict_json(raw):
                 raise ValueError("JSON_INVALID")
         elif char in "]}":
             depth -= 1
-    return json.loads(text, object_pairs_hook=_pairs, parse_constant=_constant,
-                      parse_int=_integer)
+    return check_depth(json.loads(text, object_pairs_hook=_pairs, parse_constant=_constant,
+                                  parse_int=_integer, parse_float=_float))
 
 
 def _int(value, maximum=2 ** 63 - 1):
@@ -128,7 +157,7 @@ def project_state(value):
     if isinstance(executor, dict) and isinstance(executor.get("unreleased"), list):
         unreleased = len(executor["unreleased"])
     backend = capture["backend"].lower()
-    if backend not in ("wgc", "dxgi", "gdi", "mss", "none"):
+    if backend not in ("wgc", "printwindow", "dxgi", "gdi", "mss", "none"):
         backend = "unknown"
     return {
         "reported_capture": {
@@ -193,8 +222,7 @@ def _headers(raw):
         if any(ord(char) < 32 and char != "\t" or ord(char) == 127 for char in value):
             raise ProbeFailure("HTTP_FRAMING_UNSUPPORTED")
         key = key.lower()
-        # In particular, even identical duplicate Content-Length is refused.
-        if key in fields:
+        if key in fields:  # includes identical duplicate Content-Length
             raise ProbeFailure("HTTP_FRAMING_UNSUPPORTED")
         fields[key] = value.strip()
     return status, fields
@@ -306,6 +334,5 @@ def probe_state(selected_origin, credential, limits=None, *, socket_factory=None
             try:
                 sock.close()
             except Exception:
-                # Never replace a result with raw socket cleanup diagnostics.
                 result = {"ok": False, "reason_code": "HTTP_CLOSE_FAILED", "http_status": status}
     return result
