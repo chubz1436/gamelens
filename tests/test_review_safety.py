@@ -105,12 +105,31 @@ def test_queue_capacity_is_validated(capacity):
         InputExecutor(fake_safety(), queue_capacity=capacity)
 
 
-def test_concurrent_shutdown_with_capacity_one_never_enqueues_a_sentinel():
+def test_concurrent_shutdown_with_capacity_one_never_enqueues_a_sentinel(monkeypatch):
     import threading
     executor = InputExecutor(fake_safety(), queue_capacity=1)
     assert executor.submit(Sequence([]))
-    joined = threading.Barrier(2)
-    executor._thread = SimpleNamespace(join=lambda timeout: joined.wait(timeout=2))
+    # Force BOTH legacy shutdowns past drain() before either inserts its
+    # sentinel, then hold the successful insertion until both have attempted
+    # put_nowait. With capacity one the old implementation deterministically
+    # raises queue.Full. Cancellation-only shutdown never touches this path.
+    before_put = threading.Barrier(2)
+    after_put = threading.Barrier(2)
+    original_put = executor._queue.put_nowait
+    sentinels = []
+
+    def synchronized_put(item):
+        if item is not None:
+            return original_put(item)
+        sentinels.append(item)
+        before_put.wait(timeout=2)
+        try:
+            return original_put(item)
+        finally:
+            after_put.wait(timeout=2)
+
+    monkeypatch.setattr(executor._queue, "put_nowait", synchronized_put)
+    executor._thread = SimpleNamespace(join=lambda timeout: None)
     errors = []
 
     def shutdown():
@@ -123,9 +142,10 @@ def test_concurrent_shutdown_with_capacity_one_never_enqueues_a_sentinel():
     for thread in callers:
         thread.start()
     for thread in callers:
-        thread.join(timeout=3)
+        thread.join(timeout=5)
     assert not any(thread.is_alive() for thread in callers)
     assert errors == []
+    assert sentinels == []
     assert executor._queue.empty()
 
 
