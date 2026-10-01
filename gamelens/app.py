@@ -19,6 +19,7 @@ from gamelens.capture import Backend, CaptureSupervisor
 from gamelens.coords import GeometryTracker
 from gamelens.input import InputExecutor
 from gamelens.safety import SafetySupervisor
+from gamelens.target import parse_anchor, same_at_anchor
 from gamelens.server import (
     ENCODE_FAILED, NO_FRAME, ActionLog, Encoded, Tokens, encode_jpeg,
 )
@@ -155,14 +156,19 @@ class ObservationRegistry:
     catch. So the record is made when the image is issued, and /act names it.
     """
 
-    def __init__(self, capacity: int = 256, ttl: float = 5.0) -> None:
+    def __init__(self, capacity: int = 16, ttl: float = 120.0) -> None:
         self._records: OrderedDict = OrderedDict()
+        self._stream_records: OrderedDict = OrderedDict()
         self._capacity = capacity
         self._ttl = ttl
         self._lock = threading.Lock()
 
+    @property
+    def retention_seconds(self) -> float:
+        return self._ttl
+
     def issue(self, observation, *, jpeg: bytes | None = None,
-              quality: int | None = None, moving=None) -> str:
+              quality: int | None = None, moving=None, retain: bool = True) -> str:
         """Record what was handed out. ``jpeg`` and ``quality`` are the exact
         image the caller received, kept so a later rebind can compare the
         pixels the decision was made on (GL039-R3); ``moving`` is which tiles
@@ -171,13 +177,17 @@ class ObservationRegistry:
         token = secrets.token_urlsafe(9)
         now = time.monotonic()
         with self._lock:
-            self._records[token] = (observation, now, jpeg, quality, moving)
-            while len(self._records) > self._capacity:
-                self._records.popitem(last=False)
+            # Agent snapshots survive model/tool round trips. A dashboard stream
+            # must not evict the exact picture an agent is still deciding on.
+            records = self._records if retain else self._stream_records
+            capacity, ttl = (self._capacity, self._ttl) if retain else (256, 5.0)
+            records[token] = (observation, now, jpeg, quality, moving)
+            while len(records) > capacity:
+                records.popitem(last=False)
             # Opportunistic expiry; bounded work per issue.
-            for key in [k for k, (_, t, *_rest) in list(self._records.items())[:8]
-                        if now - t > self._ttl]:
-                self._records.pop(key, None)
+            for key in [k for k, (_, t, *_rest) in list(records.items())[:8]
+                        if now - t > ttl]:
+                records.pop(key, None)
         return token
 
     def resolve(self, token: str):
@@ -187,12 +197,16 @@ class ObservationRegistry:
     def record(self, token: str):
         """``(observation, jpeg, quality, moving)`` for a live record, else None."""
         with self._lock:
-            entry = self._records.get(token)
+            records, ttl = self._records, self._ttl
+            entry = records.get(token)
+            if entry is None:
+                records, ttl = self._stream_records, 5.0
+                entry = records.get(token)
             if entry is None:
                 return None
             observation, issued_at, jpeg, quality, moving = entry
-            if time.monotonic() - issued_at > self._ttl:
-                self._records.pop(token, None)
+            if time.monotonic() - issued_at > ttl:
+                records.pop(token, None)
                 return None
             return observation, jpeg, quality, moving
 
@@ -257,6 +271,30 @@ def _button(name: str):
     from gamelens.input import button_from_name
 
     return button_from_name(name)
+
+
+def session_feedback(target: dict | None, capture: dict, safety: dict, guard: str) -> dict:
+    """Explain the current interlock result; never grants input authority."""
+    if safety.get("killed"):
+        status, message = "stopped", "Stopped. Restart GameLens for a new session."
+    elif target is None:
+        status, message = "no-target", "Target window is gone. Start a new session on the game."
+    elif safety.get("executor", {}).get("unreleased"):
+        status, message = "blocked", "An input release failed. New input is blocked."
+    elif not capture.get("healthy"):
+        status, message = "no-capture", "Capture is unavailable. Wait for a healthy game frame."
+    elif not safety.get("armed"):
+        status, message = "disarmed", "Operator: Arm to test in dry-run, then Go live."
+    elif not target.get("foreground"):
+        status, message = "needs-focus", "Bring the game to the foreground before acting."
+    elif guard != "ok":
+        status, message = "blocked", f"Input blocked: {guard}."
+    elif safety.get("dry_run"):
+        status, message = "dry-run", "Dry-run: actions are simulated; no input is injected."
+    else:
+        status, message = "live", "Live input is enabled. Inspect the game to verify each result."
+    return {"status": status, "message": message, "input_ready": status == "live",
+            "guard": guard, "shared_input": True}
 
 
 class GameLens:
@@ -385,7 +423,8 @@ class GameLens:
         non-blocking, so the HTTP layer can poll it from the event loop."""
         return self.capture.frames.latest_id()
 
-    def encode_frame(self, quality: int = 70, *, min_frame_id: int | None = None):
+    def encode_frame(self, quality: int = 70, *, min_frame_id: int | None = None,
+                     retain: bool = True):
         """Encode the newest frame and register what was handed out. Never blocks.
 
         Returns ``Encoded`` -- whose ``frame_id`` is read off the very frame
@@ -412,7 +451,7 @@ class GameLens:
             jpeg, scale = encode_jpeg(frame.array, quality=quality)
             observation = self.arbiter.observation_for(frame, scale=scale)
             token = self.observations.issue(observation, jpeg=jpeg, quality=quality,
-                                            moving=self.activity.snapshot(
+                                            retain=retain, moving=self.activity.snapshot(
                                                 frame.frame_id, frame.session_id,
                                                 (frame.height, frame.width)))
             # Again after the encode: the backend can be dropped while it runs,
@@ -452,7 +491,7 @@ class GameLens:
         self, *, observation_id: str, x: float, y: float,
         label: str = "", source: str = "agent", wait: float = DISPATCH_WAIT,
         measure: bool = False, settle: float = CHURN_SETTLE,
-        button: str = "left", rebind: bool = False,
+        button: str = "left", rebind: bool = False, anchor: dict | None = None,
     ) -> Dispatch:
         """Click at a coordinate in an image the server issued.
 
@@ -467,7 +506,11 @@ class GameLens:
         which is the first recipe in the game. `Arbiter.click_action` already
         took a button; nothing could reach it.
         """
-        bound = self._bind(observation_id, label, rebind, points=[(x, y)])
+        if anchor is not None:
+            anchor = parse_anchor(anchor, x, y)
+            if not rebind:
+                raise ValueError("anchor requires rebind=true")
+        bound = self._bind(observation_id, label, rebind, points=[(x, y)], anchor=anchor)
         if isinstance(bound, Dispatch):
             return bound
         observation, binding = bound
@@ -603,7 +646,7 @@ class GameLens:
         """How many new inputs one sequence may contain: the rate bucket's size."""
         return self.safety.rate_capacity
 
-    def _bind(self, observation_id: str, label: str, rebind: bool, *, points=()):
+    def _bind(self, observation_id: str, label: str, rebind: bool, *, points=(), anchor=None):
         """The observation an action runs on, and how it was chosen.
 
         Returns ``(observation, binding)`` or a denial ``Dispatch``.
@@ -627,7 +670,7 @@ class GameLens:
         shown, shown_jpeg, quality, moving = record
         if not rebind:
             return shown, None
-        if self.arbiter.is_fresh(shown):
+        if self.arbiter.is_fresh(shown) and anchor is None:
             return shown, {"bound_to": "shown"}
 
         binding: dict = {"bound_to": None, "shown_frame": shown.frame_id}
@@ -647,6 +690,18 @@ class GameLens:
                         detail = "no image on record to compare the click point against"
                     else:
                         fresh_jpeg, scale = encode_jpeg(frame.array, quality=quality or 70)
+                        if anchor is not None:
+                            same = same_at_anchor(shown_jpeg, fresh_jpeg, anchor, *points[0])
+                            binding.update(same)
+                            if scale != shown.scale:
+                                verdict = Rejection.GEOMETRY_MOVED
+                            elif not same["anchor_ok"]:
+                                detail = "the visible yellow anchor label changed; look again"
+                                self.log.add(f"{label}: {detail}", "denied")
+                                return Dispatch("TARGET_CHANGED", "denied", detail, binding=binding)
+                            else:
+                                binding["bound_to"] = "anchored"
+                                return fresh, binding
                         checks = [same_at_click(shown_jpeg, fresh_jpeg, *p, moving=moving)
                                   for p in points]
                         # The worst point speaks for all of them. A point that
@@ -875,6 +930,10 @@ class GameLens:
             target = None
 
         agent_stats = self.agent.stats() if self.agent else {}
+        safety = {**self.safety.snapshot(), "executor": self.executor.snapshot()}
+        session = session_feedback(target, capture, safety, self.safety.check(consume=False).value)
+        entries = self.log.entries()
+        session["latest_event"] = entries[-1] if entries else None
         return {
             "target": target,
             "capture": {
@@ -895,10 +954,12 @@ class GameLens:
                 "healthy": capture["healthy"],
                 "transitions": capture["transitions"][-4:],
             },
-            "safety": {
-                **self.safety.snapshot(),
-                "executor": self.executor.snapshot(),
-            },
+            "safety": safety,
+            "session": session,
+            "capabilities": {"anchored_click": "yellow-label-v1", "shared_input": True},
+            "observations": {"retention_seconds": self.observations.retention_seconds,
+                             "snapshot_capacity": self.observations._capacity,
+                             "stream_retention_seconds": 5.0},
             "agent": {
                 "tier": agent_stats.get("tier", "off"),
                 "reflex_p95_ms": agent_stats.get("reflex_p95_ms", 0.0),
@@ -907,5 +968,5 @@ class GameLens:
             },
             "arbiter": self.arbiter.stats(),
             "marks": self.log.marks(),
-            "log": self.log.entries(),
+            "log": entries,
         }

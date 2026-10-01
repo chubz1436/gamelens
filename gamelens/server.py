@@ -24,6 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from gamelens.arbiter import _scroll_clicks, parse_sequence
+from gamelens.target import parse_anchor
 
 log = logging.getLogger(__name__)
 
@@ -258,7 +259,7 @@ def create_app(runtime) -> FastAPI:
 
     @app.get("/state")
     def state(role: str = Depends(any_role)) -> JSONResponse:
-        return JSONResponse(runtime.state())
+        return JSONResponse({**runtime.state(), "role": role})
 
     @app.get("/windows")
     def windows(role: str = Depends(operator_only)) -> JSONResponse:
@@ -328,12 +329,16 @@ def create_app(runtime) -> FastAPI:
         # The observation id is what a caller acts on; without it the only way
         # to name a frame is to guess an id from /state, already several frames
         # stale at 120fps. The frame id is what it waits past next time.
+        headers = {
+            "X-GameLens-Observation": result.observation_id,
+            "X-GameLens-Frame": str(result.frame_id),
+        }
+        registry = getattr(runtime, "observations", None)
+        if registry is not None:
+            headers["X-GameLens-Observation-Retention"] = str(registry.retention_seconds)
         return Response(
             result.jpeg, media_type="image/jpeg",
-            headers={
-                "X-GameLens-Observation": result.observation_id,
-                "X-GameLens-Frame": str(result.frame_id),
-            },
+            headers=headers,
         )
 
     @app.get("/stream.mjpg")
@@ -346,7 +351,7 @@ def create_app(runtime) -> FastAPI:
                 # Off the loop: this acquires a pool buffer and JPEG-encodes it.
                 # A 3441x1440 frame is tens of milliseconds, every frame, and
                 # the stream is the one endpoint that runs continuously.
-                result = await asyncio.to_thread(runtime.encode_frame, quality)
+                result = await asyncio.to_thread(runtime.encode_frame, quality, retain=False)
                 if isinstance(result, Encoded) and result.frame_id != last_frame:
                     last_frame = result.frame_id
                     # Each part names the observation it is, so a consumer
@@ -513,6 +518,10 @@ def create_app(runtime) -> FastAPI:
                 raise ValueError("rebind must be true or false")
             if rebind:
                 call["rebind"] = True
+            if "anchor" in body:
+                if kind != "click" or not rebind:
+                    raise ValueError("anchor is only supported for click with rebind=true")
+                call["anchor"] = parse_anchor(body["anchor"], call["x"], call["y"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError is in the list because JSON has no float limit: an
             # integer literal with four hundred zeros is valid JSON and a valid

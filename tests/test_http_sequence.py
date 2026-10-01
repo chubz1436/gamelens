@@ -81,6 +81,23 @@ def test_rebind_true_is_passed_through(client, runtime):
     assert runtime.submitted[-1][1]["rebind"] is True
 
 
+def test_yellow_anchor_reaches_click_only_after_validation(client, runtime):
+    anchor = dict(x=10, y=20, width=100, height=20, color="yellow")
+    r = act(client, runtime, dict(kind="click", x=60, y=55, rebind=True, anchor=anchor))
+    assert r.status_code == 200
+    assert runtime.submitted[-1]["anchor"] == anchor
+
+
+@pytest.mark.parametrize("fields", [
+    dict(kind="click", x=60, y=55),
+    dict(kind="key", key="m", rebind=True),
+    dict(kind="click", x=600, y=550, rebind=True),
+])
+def test_anchor_bad_kind_binding_or_distance_never_dispatches(client, runtime, fields):
+    r = act(client, runtime, dict(fields, anchor=dict(x=10, y=20, width=100, height=20, color="yellow")))
+    assert r.status_code == 400 and runtime.submitted == []
+
+
 def test_rebind_false_or_absent_is_not(client, runtime):
     act(client, runtime, {"kind": "key", "key": "w", "rebind": False})
     act(client, runtime, {"kind": "key", "key": "w"})
@@ -125,16 +142,21 @@ def _supervisor(forced):
 
 
 def _lens(forced) -> GameLens:
+    from gamelens.app import ObservationRegistry
+    from gamelens.safety import Denial
+
     lens = object.__new__(GameLens)
     lens.capture = _supervisor(forced)
     lens._frame_ages = []
     lens.target = type("T", (), {"hwnd": 0})()
     lens.agent = None
     lens._agent_intent = ""
-    lens.safety = type("S", (), {"snapshot": lambda self: {}})()
+    lens.safety = type("S", (), {"snapshot": lambda self: {},
+                                 "check": lambda self, **kw: Denial.NOT_ARMED})()
     lens.executor = type("E", (), {"snapshot": lambda self: {}})()
     lens.arbiter = type("A", (), {"stats": lambda self: {}})()
     lens.log = type("L", (), {"marks": lambda self: [], "entries": lambda self: []})()
+    lens.observations = ObservationRegistry()
     return lens
 
 

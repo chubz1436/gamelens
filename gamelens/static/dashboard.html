@@ -27,7 +27,7 @@
   @keyframes pulse { 50% { opacity:.45; } }
   main { display:grid; grid-template-columns:1fr 340px; gap:12px; padding:12px; }
   @media (max-width:900px) { main { grid-template-columns:1fr; } }
-  .stage { position:relative; background:#000; border:1px solid var(--line);
+  .stage { position:relative; align-self:start; background:#000; border:1px solid var(--line);
            border-radius:8px; overflow:hidden; line-height:0; }
   .stage img { width:100%; height:auto; display:block; }
   #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
@@ -55,6 +55,7 @@
            border:1px solid var(--line); background:#1f2630; color:var(--fg);
            cursor:pointer; }
   button:hover { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
   button.danger { border-color:var(--bad); color:var(--bad); }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
   kbd { font:11px var(--mono); background:#1f2630; border:1px solid var(--line);
@@ -80,6 +81,7 @@
   <span class="pill" id="p-backend">--</span>
   <span class="pill" id="p-arm">disarmed</span>
   <span class="pill" id="p-mode">dry-run</span>
+  <span class="pill" id="p-focus">-- focus</span>
   <span style="flex:1"></span>
   <span class="pill">kill: <kbd>F12</kbd></span>
 </header>
@@ -113,6 +115,9 @@
       </div>
       <p class="note">Arming alone does not inject. <em>Go live</em> leaves dry-run.
         The kill key latches until restart.</p>
+      <p id="s-session" role="status" aria-live="polite">Connecting…</p>
+      <p id="s-control-error" role="alert"></p>
+      <p class="note">Live input uses your shared mouse and keyboard. Keep the game in front.</p>
     </div>
 
     <div class="card">
@@ -135,6 +140,19 @@
         <dt>vision</dt><dd id="s-vision">--</dd>
       </dl>
       <p class="note" id="s-intent">idle</p>
+    </div>
+
+    <div class="card">
+      <h2>Session results</h2>
+      <dl>
+        <dt>access</dt><dd id="s-role">--</dd>
+        <dt>snapshots kept</dt><dd id="s-retention">--</dd>
+        <dt>completed sequences</dt><dd id="s-executed">--</dd>
+        <dt>denied at executor</dt><dd id="s-denied">--</dd>
+        <dt>held inputs</dt><dd id="s-held">--</dd>
+      </dl>
+      <p class="note" id="s-result">No action yet.</p>
+      <p class="note">Completed includes dry-run. Sent means injected. Dry-run and pending do not prove input or a game result.</p>
     </div>
 
     <div class="card">
@@ -302,6 +320,7 @@ async function tick() {
       showGate('That token was rejected. Paste the one printed at startup.');
       return;
     }
+    if (!res.ok) throw new Error('State request failed: HTTP ' + res.status);
     const s = await res.json();
 
     pill($('p-target'), s.target ? s.target.title.slice(0, 32) : 'no target',
@@ -315,6 +334,22 @@ async function tick() {
          s.safety.killed ? 'hot' : s.safety.armed ? 'on' : 'off');
     pill($('p-mode'), s.safety.dry_run ? 'dry-run' : 'LIVE',
          s.safety.dry_run ? 'dry' : 'hot');
+    pill($('p-focus'), s.target && s.target.foreground ? 'game in front' : 'needs focus',
+         s.target && s.target.foreground ? 'on' : 'dry');
+    $('p-target').title = s.target ? s.target.title : '';
+    $('s-session').textContent = s.session ? s.session.message : 'Waiting for session status.';
+    const operator = s.role === 'operator';
+    $('btn-arm').disabled = !operator || s.safety.killed || s.safety.armed;
+    $('btn-live').disabled = !operator || s.safety.killed || !s.safety.armed || !s.safety.dry_run;
+    $('btn-stop').disabled = !operator || s.safety.killed;
+    $('s-role').textContent = s.role || '--';
+    $('s-retention').textContent = s.observations ? s.observations.retention_seconds + ' s' : '--';
+    const executor = s.safety.executor || {};
+    $('s-executed').textContent = executor.executed ?? '--';
+    $('s-denied').textContent = executor.denied ?? '--';
+    $('s-held').textContent = (executor.pressed_keys || []).length + (executor.pressed_buttons || []).length;
+    const event = s.session && s.session.latest_event;
+    $('s-result').textContent = event ? event.status + ': ' + event.text : 'No action yet.';
 
     $('s-title').textContent  = s.target ? s.target.title.slice(0, 28) : '--';
     $('s-size').textContent   = s.target ? s.target.width + 'x' + s.target.height : '--';
@@ -328,13 +363,25 @@ async function tick() {
     $('s-intent').textContent = s.agent.intent || 'idle';
 
     drawMarks(s.marks, s.capture.width || 1920, s.capture.height || 1080);
-    (s.log || []).slice().reverse().forEach(addLog);
+    (s.log || []).forEach(addLog);
   } catch (err) {
     pill($('p-target'), 'server down', 'hot');
+    $('s-session').textContent = 'Connection lost. Check GameLens before acting.';
+    ['btn-arm', 'btn-live', 'btn-stop'].forEach(id => $(id).disabled = true);
   }
 }
 
-const post = (path) => fetch(path, { method: 'POST', headers: authHeaders() }).then(tick);
+const post = async (path) => {
+  $('s-control-error').textContent = '';
+  try {
+    const res = await fetch(path, { method: 'POST', headers: authHeaders() });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      $('s-control-error').textContent = body.detail || 'Control refused: HTTP ' + res.status;
+    }
+  } catch (err) { $('s-control-error').textContent = 'Control result unknown. Refresh state before retrying.'; }
+  await tick();
+};
 $('btn-arm').onclick  = () => post('/arm');
 $('btn-live').onclick = () => post('/live');
 $('btn-stop').onclick = () => post('/stop');

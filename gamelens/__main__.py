@@ -18,6 +18,7 @@ from gamelens.agent import Agent, VisionTier
 from gamelens.app import GameLens
 from gamelens.capture import Backend
 from gamelens.server import create_app
+from gamelens.session import agent_token_path, clear_agent_token, publish_agent_token
 from gamelens.windows import AmbiguousTarget, find_window, list_windows
 
 
@@ -136,10 +137,17 @@ def main(argv: list[str] | None = None) -> int:
         agent.start()
 
     app = create_app(lens)
+    token_path = agent_token_path(args.port)
+    try:
+        publish_agent_token(token_path, lens.tokens.agent)
+    except Exception:
+        lens.stop()
+        raise
     # flush: this is the only time the tokens are ever shown, and stdout is
     # block-buffered when it is not a terminal, so a redirected log would
     # otherwise withhold them until the process exits.
     print(lens.tokens.banner("127.0.0.1", args.port), flush=True)
+    print(f"  Agent token handoff (Windows-encrypted): {token_path}", flush=True)
     print("  Kill switch: F12 or Pause. It latches -- restart to clear it.\n", flush=True)
 
     try:
@@ -148,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         lens.stop()
+        clear_agent_token(token_path, lens.tokens.agent)
     return 0
 
 

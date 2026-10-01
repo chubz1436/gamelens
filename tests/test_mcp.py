@@ -371,6 +371,29 @@ def test_it_never_touches_operator_routes(client, stub):
 # --- token handling ---------------------------------------------------------------
 
 
+def test_default_encrypted_session_is_read_and_rotates_without_mcp_restart(stub, tmp_path, monkeypatch):
+    from urllib.parse import urlsplit
+    from gamelens.session import agent_token_path, publish_agent_token
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    path = agent_token_path(urlsplit(stub.url).port)
+    publish_agent_token(path, "agent-first")
+    c = Client(stub.url, env_token=None)
+    try:
+        c.call("initialize", {})
+        assert not c.tool("gamelens_state")["isError"]
+        assert stub.requests[-1][3] == "agent-first"
+        publish_agent_token(path, "agent-second")
+        assert not c.tool("gamelens_state")["isError"]
+        assert stub.requests[-1][3] == "agent-second"
+        path.unlink()
+        result = c.tool("gamelens_state")
+        assert result["isError"] and "no agent token" in texts(result)
+        assert len(stub.requests) == 2
+    finally:
+        c.close()
+
+
 def test_the_token_can_come_from_a_file_and_is_reread(stub, tmp_path):
     tok = tmp_path / "ag.tok"
     tok.write_text("first\n")

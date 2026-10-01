@@ -34,7 +34,7 @@ backend    : printwindow   33.0 fps      frame age 16 ms
 ```
 
 ```bash
-.venv/Scripts/python.exe -m gamelens --target "Your Game Window"
+.venv/Scripts/python.exe -m gamelens --target "Your Game Window" --no-agent
 ```
 
 GameLens prints two tokens to its console and opens on `http://127.0.0.1:8777/`. Paste the
@@ -42,6 +42,11 @@ GameLens prints two tokens to its console and opens on `http://127.0.0.1:8777/`.
 **Go live** — two separate steps, on purpose.
 
 **Kill switch: F12 or Pause.** It latches; restart the process to clear it.
+
+For Codex or Claude driving through MCP, use `--no-agent`: no separate paid vision API is
+needed. The dashboard shows the current access role, foreground state, blocked-input reason,
+executor results and snapshot retention. Only the operator can Arm, Go live or Stop.
+`sent` means input was injected; inspect the next image to confirm the game actually changed.
 
 ## Safety model
 
@@ -170,7 +175,7 @@ These are real and not worked around:
 .venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
-83 tests covering the interlocks, the arbiter's rejection rules, the coordinate transforms,
+609 tests covering the interlocks, the arbiter's rejection rules, the coordinate transforms,
 per-thread DPI, the observation registry and transport scaling, the HTTP boundary, and the
 outcome reporting that tells acceptance apart from execution.
 
@@ -234,9 +239,13 @@ instead of hand-written HTTP calls:
 | `gamelens_act` | one action, then the frame after it — **one call is act + see** |
 
 The server is `python -m gamelens.mcp`, a stdio MCP server that is an HTTP client of a running
-GameLens. It holds **the agent token only**, read on every request from `GAMELENS_AGENT_TOKEN`
-or else the file `%TEMP%\ag.tok` (or `--token-file`), so restarting GameLens only means updating
-that file. It cannot arm, go live or stop: those stay the operator's, on the dashboard.
+GameLens. It holds **the agent token only**. Capture startup automatically writes it to
+`%LOCALAPPDATA%\GameLens\agent-8777.token`, encrypted with Windows DPAPI for the current user;
+the MCP reads it on each request and derives the filename from its configured HTTP port.
+Normal capture shutdown removes its own credential. Restarting capture rotates it without
+restarting MCP. The operator token stays on the console. Explicit `GAMELENS_AGENT_TOKEN` takes
+precedence; `--token-file` still accepts a supplied plaintext token file. It cannot arm, go live
+or stop: those stay the operator's, on the dashboard.
 
 Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.codex/config.toml`:
 
@@ -245,7 +254,14 @@ Claude Code picks it up from this repo's `.mcp.json`. For Codex, add to `~/.code
 command = "B:/AI_Agent_folder/GAME VIDEO/.venv/Scripts/python.exe"
 args = ["-m", "gamelens.mcp"]
 cwd = "B:/AI_Agent_folder/GAME VIDEO"
+startup_timeout_sec = 20
+tool_timeout_sec = 45
 ```
+
+Keep `cwd` on the updated canonical checkout containing `gamelens/mcp.py`. After adding the
+server, reload/restart it in the app's MCP settings; an already-running chat may still have its
+previous tool list. Start capture with the quick-start command, paste the console's operator
+token into the dashboard, and check state/see before acting. Never put either token in TOML.
 
 **`kind: "sequence"`** puts overlapping steps in one action, so "walk while turning" is one
 call instead of a turn after the walk has already stopped:
@@ -324,6 +340,13 @@ and the agent gets the current image to decide on again. It never retries. Resid
 stated: a small change *away from* the click point that changes what the click means is not
 seen. `strict: true` turns rebinding off for a call.
 
+Agent `/frame.jpg` snapshots are retained for up to **120 seconds**, at most **16 snapshots**.
+Retention preserves the original pixels and provenance for comparison; it does not make an
+old frame fresh. The original arbiter deadlines, per-press guards and rebind checks remain.
+Dashboard MJPEG observations have a separate bounded pool (256 records, 5 seconds), so a busy
+preview cannot evict an agent's snapshot. Expired/evicted records still fail closed. A refusal
+returns a current image: inspect it and decide again; never automatically repeat an action.
+
 **Not using your mouse and keyboard.** Everything above still injects with `SendInput`, which
 is global, and still needs the game in the foreground. Whether a game accepts input posted to
 its window while unfocused is per game. Minecraft Bedrock (2026-09-24): posted keys work,
@@ -331,6 +354,30 @@ posted mouse clicks do not, and it pauses on focus loss and grabs the cursor whe
 so on a shared desktop it fights the Owner either way. The durable answer is a separate
 machine or VM (`tools/vm/new-test-vm.ps1`). `tools/bg_input_probe.py` is a Minecraft
 Java-only experiment on the same question.
+
+### Animated NPCs and translucent menus
+
+Ordinary clicks retain the exact pixel-patch check. For a target with a visible yellow
+name or command label, an agent can explicitly provide a small fixed-position anchor:
+
+```json
+{"kind":"click","x":583,"y":322,"rebind":true,
+ "anchor":{"x":535,"y":288,"width":125,"height":16,"color":"yellow"}}
+```
+
+Coordinates refer to the issued image. The label must be 20–256 pixels wide, 8–48 high,
+and within 40 pixels of the click. GameLens verifies identifying yellow glyphs from the
+stored image against a fresh frame at that same location. Nearby animation may change;
+a changed, hidden, moved or uninformative label refuses with `TARGET_CHANGED`. No searching,
+automatic retry or threshold override. MCP passes `anchor` inside `action` with `strict:false`.
+Use ordinary clicks for inventory items and targets without such a label.
+
+Target/session/geometry/preemption, foreground, pointer occlusion, watchdog, rate and kill
+guards remain. If the human moves the cursor during an agent click's settle time, the
+executor refuses the press even when the cursor is still inside the game. Reobserve before
+resuming. A video covering the destination also refuses; GameLens never steals focus to
+continue. This improves target verification, not desktop isolation: simultaneous Owner
+mouse/keyboard use requires the game and GameLens in a separate PC/guest Windows session.
 
 ## Provenance
 
