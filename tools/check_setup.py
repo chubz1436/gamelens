@@ -9,13 +9,15 @@ sys.dont_write_bytecode = True
 
 if sys.version_info[:2] < (3, 11):
     if "json" in sys.argv or "--format=json" in sys.argv:
-        sys.stdout.write('{"schema_version":1,"mode":"offline","checks":[{"id":"python","scope":"environment","status":"blocked","affects_exit":true,"reason_code":"PYTHON_UNSUPPORTED","safe_evidence":{},"manual_next_step":"Select an existing Python 3.11 or newer interpreter manually."}],"actual_frame_verification":{"status":"unverified","reason_code":"FRAME_NOT_REQUESTED"},"input_authorization":{"granted_by_checker":false},"exit_code":2}\n')
+        mode = "connected" if "--connect" in sys.argv else "offline"
+        sys.stdout.write('{"schema_version":1,"mode":"%s","checks":[{"id":"python","scope":"environment","status":"blocked","affects_exit":true,"reason_code":"PYTHON_UNSUPPORTED","safe_evidence":{},"manual_next_step":"Select an existing Python 3.11 or newer interpreter manually."}],"actual_frame_verification":{"status":"unverified","reason_code":"FRAME_NOT_REQUESTED"},"input_authorization":{"granted_by_checker":false},"exit_code":2}\n' % mode)
     else:
         sys.stdout.write("blocked: PYTHON_UNSUPPORTED. Select an existing Python 3.11+ interpreter. No checks were run.\n")
     raise SystemExit(2)
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -37,6 +39,12 @@ MAX_METADATA_ENTRIES = 4096
 KNOWN_DEPENDENCIES = frozenset(("windows-capture", "mss", "pywin32", "numpy",
                               "opencv-python", "fastapi", "uvicorn", "anthropic",
                               "pywebview"))
+SESSION_REASONS = frozenset((
+    "SESSION_PORT_INVALID", "SESSION_LOCATION_UNVERIFIED", "SESSION_LOCATION_UNSUPPORTED",
+    "SESSION_TOKEN_MISSING", "SESSION_TOKEN_TOO_LARGE", "SESSION_TOKEN_UNREADABLE",
+    "SESSION_FORMAT_UNSUPPORTED", "SESSION_DECRYPTION_UNAVAILABLE", "SESSION_TOKEN_INVALID",
+    "SESSION_DECRYPTION_FAILED",
+))
 NEXT_STEPS = {
     "environment": "Inspect the selected project environment manually; nothing was installed or repaired.",
     "mcp": "Inspect only the explicitly selected host configuration; no host command was executed.",
@@ -103,7 +111,7 @@ def _arguments(argv):
 def new_report(mode):
     return {
         "schema_version": 1, "mode": mode, "checks": [],
-        "reported_capture": {"status": "unverified", "reason_code": "STATE_NOT_REQUESTED"},
+        "reported_capture": {"status": "unverified", "reason_code": "STATE_NOT_VERIFIED" if mode == "connected" else "STATE_NOT_REQUESTED"},
         "actual_frame_verification": {"status": "unverified", "reason_code": "FRAME_NOT_REQUESTED"},
         "input_authorization": {"granted_by_checker": False},
         "target_match": {"status": "unverified", "reason_code": "EXPECTED_TARGET_NOT_SUPPLIED"},
@@ -180,7 +188,6 @@ def select_session(args, report):
     else:
         add(report, "selection", "selection", "skipped", "SESSION_NOT_SELECTED", affects_exit=False)
         return None
-    # Names/ports/origins have passed exact-shape validation; no other clients appear.
     report["selected_session"] = selected.copy()
     add(report, "selection", "selection", "pass", "SESSION_SELECTED",
         {"port": selected["port"], "named": bool(args.client)})
@@ -284,8 +291,6 @@ def inspect_environment(root, scope, report):
         add(report, "project_interpreter", "environment", "pass", "PROJECT_INTERPRETER_FILE_PRESENT")
     except session.FileBoundaryError:
         add(report, "project_interpreter", "environment", "blocked", "PROJECT_INTERPRETER_MISSING_OR_UNREADABLE")
-    # Inventory the known Windows project layout, not the executing system's
-    # package search path. Never import metadata providers, entry points or .pth.
     try:
         versions = _metadata_versions(root / ".venv" / "Lib" / "site-packages", pins)
     except (session.FileBoundaryError, OSError, ValueError):
@@ -325,7 +330,7 @@ def inspect_mcp(args, root, selected, report):
             return
         raw = session.read_local_bytes(path)
         if args.mcp_host == "codex":
-            data = tomllib.loads(raw.decode("utf-8-sig"))
+            data = transport.check_depth(tomllib.loads(raw.decode("utf-8-sig")))
             group = data.get("mcp_servers")
         else:
             data = transport.strict_json(raw)
@@ -337,10 +342,16 @@ def inspect_mcp(args, root, selected, report):
     except (session.FileBoundaryError, ValueError, UnicodeError, RecursionError):
         add(report, "mcp_config", "mcp", "blocked", "MCP_CONFIG_UNREADABLE_OR_INVALID")
         return
-    allowed = {"command", "args", "env", "cwd", "enabled"} if args.mcp_host == "codex" else {"type", "command", "args", "env"}
+    allowed = {"command", "args", "env", "cwd", "enabled", "startup_timeout_sec", "tool_timeout_sec"} if args.mcp_host == "codex" else {"type", "command", "args", "env"}
     if set(entry) - allowed or entry.get("type", "stdio") != "stdio":
         add(report, "mcp_config", "mcp", "unverified", "MCP_CONFIG_UNSUPPORTED")
         return
+    for field in ("startup_timeout_sec", "tool_timeout_sec"):
+        if field in entry:
+            value = entry[field]
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 86400:
+                add(report, "mcp_config", "mcp", "unverified", "MCP_CONFIG_UNSUPPORTED")
+                return
     if "enabled" in entry and type(entry["enabled"]) is not bool:
         add(report, "mcp_config", "mcp", "blocked", "MCP_CONFIG_SCHEMA_INVALID")
         return
@@ -368,7 +379,6 @@ def inspect_mcp(args, root, selected, report):
     except session.FileBoundaryError:
         add(report, "mcp_config", "mcp", "blocked", "MCP_INTERPRETER_MISSING_OR_UNSUPPORTED")
         return
-    # Presence is not proof that a configured executable is Python. Never run it.
     add(report, "mcp_interpreter", "mcp", "pass", "MCP_INTERPRETER_FILE_PRESENT", {
         "matches_executing_interpreter": _same_path(command, sys.executable),
         "matches_project_interpreter": _same_path(command, root / ".venv" / "Scripts" / "python.exe"),
@@ -428,7 +438,8 @@ def connected_check(args, selected, report):
         credential = session.read_selected_agent(selected["port"])
         result = transport.probe_state(selected["url"], credential)
     except session.SessionError as exc:
-        add(report, "connection", "connection", "blocked", exc.args[0])
+        reason = exc.args[0] if exc.args and exc.args[0] in SESSION_REASONS else "SESSION_TOKEN_UNREADABLE"
+        add(report, "connection", "connection", "blocked", reason)
         return
     finally:
         credential = None
