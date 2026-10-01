@@ -49,6 +49,29 @@ Replace the example paths/HWND with the owner's actual selections. These example
 
 The wrapper mirrors the Python options (`-McpHost`, `-McpConfig`, `-ClientsFile`, etc.) and adds `-PythonPath`. An explicit missing interpreter never falls back. Otherwise it tries the project `.venv/Scripts/python.exe`, then an existing system Python application, excluding Microsoft Store aliases. It does not use `py.exe`, installers, configuration-derived commands, elevation or execution-policy changes. It launches only this checker with `UseShellExecute=false`, quotes arguments for Windows argv, and suppresses raw child errors. Its 30-second child-process watchdog is separate from the stricter HTTP deadline; it kills only its own diagnostic child, not the GameLens session.
 
+### Wrapper review corrections after `928aa8cf`
+
+The same path gate now applies to explicit `-PythonPath`, project `.venv` and every system fallback candidate. It accepts fully qualified DOS paths, checks `DriveInfo.DriveType` **before any existence/attribute probe**, then checks attributes from the drive root down through every parent to the executable. Only Fixed, Removable and Ram drive types are accepted. Network (including mapped drive letters), Unknown, missing roots, unsupported drives and attribute-query failures fail closed. Any reparse point, including a root/parent junction, stops inspection before reaching its descendants. No elevation or filesystem bypass is attempted.
+
+System fallback no longer calls `Get-Command` or `where.exe`, because command discovery could itself probe an unvalidated PATH entry. It considers at most 256 literal inherited PATH directories (32,768 characters total) and gates each `python.exe`/`python3.exe` candidate before probing it. Empty/CWD entries, unresolved relative paths, Store aliases and unsupported locations are not searched. An explicitly supplied empty or invalid path never falls back. The known checker script's own parent chain is also gated, and selected paths are rechecked before launch.
+
+| Child-output boundary | Implemented limit/behavior — runtime NOT VERIFIED |
+|---|---|
+| stdout | 65,536 bytes maximum collected |
+| stderr | 16,384 bytes maximum consumed before rejection; content is never retained for reporting |
+| Combined stdout + stderr | 65,536 bytes maximum accepted, even when each stream is individually below its cap |
+| Reads | One outstanding incremental byte read per stream, each at most 4,096 bytes; both pipes are drained concurrently |
+| Scratch space | Two fixed 4 KiB buffers; an over-limit read is detected before retention or output |
+| Deadline | 30 seconds for the owned child/pipe collection; separate from the 3-second HTTP deadline |
+| Failure | Fixed sanitized error only; discard any partial stdout, all stderr and exception details |
+| Cleanup | Kill the owned child when still running, wait up to 2 seconds for exit, then dispose readers/process on all exits |
+
+`ReadToEndAsync` and post-hoc character counting are no longer used. Neither stream can monopolize a blocking read while the other pipe fills. Complete EOF on both streams **and process exit** are required for success. Non-empty stderr, invalid UTF-8, malformed output or inconsistent report metadata cannot be forwarded. JSON output is re-serialized only after complete collection and validation; no partial/raw child buffer is printed.
+
+Wrapper failures include `CHECKER_OUTPUT_LIMIT`, `CHECKER_PROCESS_DEADLINE`, `CHECKER_CHILD_IO_FAILED`, `PYTHON_LAUNCH_FAILED`, and `CHECKER_CLEANUP_UNVERIFIED` (exit 70). The last code must not be interpreted as proof of successful termination. Test helpers may shorten the process timeout but cannot increase it; this is not a CLI or environment override.
+
+These are path-based checks, **not protection against every rename, remap or filesystem race between verification and launch**. There is no executable-signature, transitive DLL/configuration-loader or general hostile-process sandbox. Use trusted Python and the canonical checker. Cleanup is scoped to the process owned by the wrapper, not arbitrary unrelated processes or a universal descendant-process killer. An authored venv test checks the actual checker handle separately from a possible interpreter launcher; launcher/OS behavior remains unverified until executed.
+
 Python 3.11+ is required for actual checks. The **entire bootstrap file** avoids newer syntax so an older interpreter can reach its version guard before modern imports. Missing Python is handled by the PowerShell wrapper. Real older-interpreter behavior remains unverified until that optional test is run. Use a trusted Python installation; this checker is not a sandbox for a malicious interpreter or interpreter startup hooks.
 
 ## Offline environment inventory
@@ -140,6 +163,11 @@ Tests are isolated in `tests_setup/` so they do not inherit native fixtures from
 | `test_report_contract.py` | Status/exit semantics, separate reported/verified/authorization claims, invalid arguments and sanitized failures | NOT RUN |
 | `test_read_only.py` | Before/after fixture snapshots, no startup/control calls, one selected request, no persistence, bounded metadata scan | NOT RUN |
 | `test_static_review_regressions.py` | PrintWindow, TOML depth, overflowing floats, safe error fallbacks and known Codex timeout fields | NOT RUN |
+| `test_wrapper.py` with `wrapper_probe.ps1` | Explicit/project/system path gates; mapped-network/parent-junction synthetic cases; quoting and exit forwarding; concurrent bounded pipes; timeout, checker-handle cleanup, secret canaries and no-mutation snapshots | NOT RUN |
+
+The wrapper fixtures load only known wrapper function definitions for synthetic drive/attribute probes; they do not create a real mapped drive or junction, contact a share, or add production bypass flags. Subprocess cases use disposable copies and the existing trusted Python. Temporary no-pip venvs exercise real interpreter paths with spaces and cleanup through a possible venv launcher. The test holds the actual fixture checker's process handle so launcher exit alone is not counted as no-orphan evidence. Synthetic fixture PID files are excluded from mutation snapshots; all seeded configuration/credential files are compared before/after. There are no real session credentials in these fixtures.
+
+Additional cases cover actual offline checker JSON in a disposable project, exact forwarding of every supported exit code, missing explicit Python without fallback, simulated old-version bootstrap handling, optional owner-selected real older Python, oversized stdout/stderr, aggregate overflow below individual caps, multibyte output, hung children with partial output, and EOF on both pipes while the child remains alive. Simulated old version metadata is not real older-interpreter verification. Windows process/pipe cases skip on non-Windows; absent PowerShell or an older interpreter is not silently installed. Execution policy is never bypassed.
 
 After separate CHUBot/Codex review and authorization, the focused command is:
 
@@ -152,6 +180,8 @@ Then perform Python/PowerShell syntax checks and `git diff --check`; these also 
 ## Static-review notes and remaining limitations
 
 Source read-through corrected missing PrintWindow classification, added TOML depth validation and non-finite JSON-number rejection, distinguished an unsuccessful connected check from an unrequested state read, and normalized unexpected internal error reasons. Regression tests were authored, not executed. The known Codex timeout fields present in the existing README are inspected without affecting transport limits.
+
+The follow-up wrapper correction replaces pre-gate PATH command discovery and unbounded child-stream collection. Source review includes root-to-leaf ordering, per-stream/combined byte accounting, both-pipe EOF plus process-exit handling, fixed failure outputs and the owned-process cleanup path. Test/source correspondence was reviewed without running parsers or tests. No runtime, installer, dependency, workflow or Phase 2 files were changed for this correction.
 
 PowerShell argument handling/process cleanup, real older-Python parsing, Windows DPAPI/drive/reparse behavior, deadline behavior under OS scheduling and compatibility with the running server's framing remain **unverified**. Filesystem reads/DPAPI are not covered by the HTTP deadline. The wrapper watchdog is not a hard real-time guarantee. A valid `/state` response is never live gameplay acceptance.
 
