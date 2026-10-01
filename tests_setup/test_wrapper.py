@@ -2,8 +2,8 @@
 
 Windows-only execution uses disposable fixtures and existing Python/PowerShell.
 No GameLens runtime, real credentials, network shares, mapped drives, installation,
-elevation, Pester or policy bypass. One test creates a disposable no-pip venv to
-exercise a REAL interpreter path with spaces; nothing is installed into it.
+elevation, Pester or policy bypass. Tests create disposable no-pip venvs to exercise
+REAL interpreter paths with spaces and launcher cleanup; nothing is installed.
 """
 import ctypes
 from ctypes import wintypes
@@ -197,7 +197,9 @@ class WrapperTests(unittest.TestCase):
                 else:
                     self.assertTrue(already_exited)
             else:
-                self.assertFalse((self.root / "child.pid").exists(), "Rejected path launched a checker")
+                # Actual-checker smoke cases do not contain the PID-writing shim;
+                # this assertion is not process-cleanup evidence for those cases.
+                self.assertFalse((self.root / "child.pid").exists(), "Unexpected synthetic checker launch")
             return process.returncode, result
         finally:
             # Clean up only processes owned by this disposable fixture. Holding
@@ -240,6 +242,19 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual(report["checks"][0]["reason_code"], "FIXTURE_COMPLETE")
                 self.assertFalse(report["input_authorization"]["granted_by_checker"])
 
+    def test_actual_checker_offline_json_in_disposable_project(self):
+        for name in ("check_setup.py", "setup_check_http.py", "setup_check_session.py"):
+            shutil.copyfile(WRAPPER.parent / name, self.tools / name)
+        shutil.copyfile(HERE.parent / "requirements.txt", self.root / "requirements.txt")
+        self.scenario()
+        actual, report = self.execute(self.wrapper_args(sys.executable), expect_child=False)
+        self.assertEqual(actual, 2)  # Deliberately missing project .venv, no repair.
+        self.assertEqual(report["mode"], "offline")
+        reasons = {row["reason_code"] for row in report["checks"]}
+        self.assertIn("PROJECT_ENVIRONMENT_MISSING_OR_UNREADABLE", reasons)
+        self.assertIn("CONNECT_NOT_REQUESTED", reasons)
+        self.assertFalse(report["input_authorization"]["granted_by_checker"])
+
     def test_real_interpreter_and_project_with_spaces_and_argv_quoting(self):
         # Disposable stdlib venv, copies rather than symlinks; no pip/install/download.
         environment = self.root / "Interpreter With Spaces"
@@ -280,7 +295,6 @@ class WrapperTests(unittest.TestCase):
         old = os.environ.get("GAMELENS_TEST_OLD_PYTHON")
         if not old:
             self.skipTest("No owner-selected older Python; simulated gate is NOT real old-runtime validation")
-        # Actual bootstrap, not the synthetic modern-Python fixture.
         (self.tools / "check_setup.py").write_bytes((WRAPPER.parent / "check_setup.py").read_bytes())
         self.scenario()
         actual, report = self.execute(self.wrapper_args(old), expect_child=False)
@@ -348,6 +362,20 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(report["reason"], "CHECKER_PROCESS_DEADLINE")
             self.assertFalse(report["has_child_output"])
 
+    def test_venv_timeout_checks_actual_checker_handle_not_just_launcher_exit(self):
+        environment = self.root / "Interpreter With Spaces"
+        venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
+        self.scenario("hung")
+        actual, report = self.execute([str(PROBE), "-WrapperPath", str(self.wrapper), "-Case", "collect",
+                                       "-PythonPath", str(environment / "Scripts" / "python.exe"),
+                                       "-CheckerFile", str(self.tools / "check_setup.py"),
+                                       "-TimeoutMilliseconds", "2000"])
+        self.assertEqual(actual, 0)
+        self.assertEqual(report["reason"], "CHECKER_PROCESS_DEADLINE")
+        self.assertFalse(report["has_child_output"])
+        # execute() holds the PID-written checker's process handle, including
+        # when CPython's venv redirector is a DIFFERENT owning launcher process.
+
     def test_entrypoint_never_leaks_partial_output_errors_or_canaries(self):
         for mode in ("stdout", "stderr", "combined", "stderr-small", "malformed", "invalid-utf8", "exception"):
             with self.subTest(mode=mode):
@@ -362,7 +390,6 @@ class WrapperTests(unittest.TestCase):
 
 class WrapperSourceContractTests(unittest.TestCase):
     def test_no_unbounded_reads_or_pre_validation_command_discovery(self):
-        # Source-contract checks supplement but do not replace Windows execution.
         source = WRAPPER.read_text(encoding="utf-8")
         self.assertNotIn(".ReadToEndAsync(", source)
         self.assertNotIn(".ReadToEnd(", source)
@@ -371,5 +398,5 @@ class WrapperSourceContractTests(unittest.TestCase):
         self.assertIn("$stderrCap = 16384", source)
         self.assertIn("$stdoutCap = 65536", source)
         self.assertIn("$TimeoutMilliseconds = 30000", source)
-        self.assertIn("$process.WaitForExit(2000)", source)
+        self.assertIn("$Process.WaitForExit(2000)", source)
         self.assertIn("$start.UseShellExecute = $false", source)
