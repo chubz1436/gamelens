@@ -2,6 +2,15 @@
 
 ## Accepted delivery (October 1, 2026)
 
+Atong69's later recorded run finished **2983.035s / 1200 B-Gold**, including
+calibration and repair pauses; it is not a clean speed benchmark. Its separate
+character profile is under `characters/atong69`. The owner taught portal casting
+while answering math. **8 -> 7 was verified live**: cast-to-confirmation3.360s,
+cast-to-completed-remount15.391s. Dismount closes the NPC menu; use its HUD Menu
+button to reopen it while casting, then submit the verified answer. Arrival and
+mount proof remain required. Opt in with `--overlap-portals`; **1 -> 6 overlap
+has not yet been live-verified**. The original sequential route remains default.
+
 The owner accepted the existing result and closed the improvement goal.
 Best clean automatic run: **867.060 seconds**, all 17 chapters completed.
 The original 700-second benchmark remains **unachieved**. No scrolls were

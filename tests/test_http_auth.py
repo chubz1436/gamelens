@@ -116,19 +116,44 @@ def test_state_accepts_either_token(client, runtime):
 # --- capability separation -------------------------------------------------
 
 
-def test_agent_token_cannot_arm(client, runtime):
+def test_agent_token_can_arm_without_game_input(client, runtime):
     response = client.post("/arm", headers=agent(runtime))
-    assert response.status_code == 403
-    assert not runtime.safety.armed, "an agent credential must never arm the system"
+    assert response.status_code == 200
+    assert runtime.safety.armed and runtime.safety.dry_run
+    assert runtime.submitted == []
 
 
-def test_agent_token_cannot_go_live(client, runtime):
-    assert client.post("/live", headers=agent(runtime)).status_code == 403
-    assert runtime.safety.dry_run is True
+def test_agent_token_can_go_live_without_game_input(client, runtime):
+    assert client.post("/arm", headers=agent(runtime)).status_code == 200
+    assert client.post("/live", headers=agent(runtime)).status_code == 200
+    assert runtime.safety.dry_run is False
+    assert runtime.submitted == []
 
 
-def test_agent_token_cannot_stop(client, runtime):
-    assert client.post("/stop", headers=agent(runtime)).status_code == 403
+def test_agent_token_can_stop(client, runtime):
+    assert client.post("/stop", headers=agent(runtime)).status_code == 200
+    assert runtime.safety.killed
+
+
+@pytest.mark.parametrize("path", ["/arm", "/live", "/stop"])
+def test_session_controls_remain_authenticated_and_same_origin(client, runtime, path):
+    assert client.post(path).status_code == 401
+    assert client.post(path, headers={"X-GameLens-Token": "wrong"}).status_code == 401
+    assert client.post(path, headers={**agent(runtime), "Origin": "https://evil.example"}).status_code == 403
+    assert not runtime.safety.armed and not runtime.safety.killed and runtime.safety.dry_run
+
+
+def test_agent_cannot_clear_stop_or_go_live_without_arm(client, runtime):
+    from gamelens.safety import SafetySupervisor
+    runtime.safety = SafetySupervisor(123)
+    assert client.post("/live", headers=agent(runtime)).status_code == 409
+    assert not runtime.safety.armed and runtime.safety.dry_run
+    assert client.post("/arm", headers=agent(runtime)).status_code == 200
+    assert client.post("/live", headers=agent(runtime)).status_code == 200
+    assert client.post("/stop", headers=agent(runtime)).status_code == 200
+    assert client.post("/arm", headers=agent(runtime)).status_code == 409
+    assert client.post("/live", headers=agent(runtime)).status_code == 409
+    assert runtime.safety.killed and not runtime.safety.armed and runtime.safety.dry_run
 
 
 def test_operator_token_can_arm(client, runtime):

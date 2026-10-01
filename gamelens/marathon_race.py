@@ -49,11 +49,44 @@ def receipt_chapter(frame, assets):
 
 
 class RaceController(FastExchange):
-    def __init__(self, client, profile, evidence, chapter=1):
+    def __init__(self, client, profile, evidence, chapter=1, overlap_portals=False):
         super().__init__(client, profile, evidence)
         self.progress = RaceProgress(chapter)
         self.started_at = None
         self.events = []
+        self.overlap_portals = overlap_portals
+        self._portal_overlap = None
+
+    def read(self):
+        frame=super().read()
+        overlap=getattr(self,"_portal_overlap",None)
+        if overlap is not None and overlap.phase=="awaiting_receipt":
+            overlap.observe_arrival(self,refresh=False)
+        return frame
+
+    def run(self, trainer):
+        chapter=self.progress.chapter
+        self.read()
+        if (self.overlap_portals and (chapter,trainer) in ((8,1),(14,8))
+                and self.athens_portal_ready()):
+            from gamelens.marathon_overlap import PortalExchangeOverlap
+            self._portal_overlap=PortalExchangeOverlap()
+            self._portal_overlap.before_exchange(self,chapter,trainer)
+            # Dismount dismisses the NPC menu. Its HUD button reopens it
+            # without a ground click that could interrupt the portal cast.
+            self.read()
+            category_y=280 if trainer==1 else 226
+            if self.portrait_matches(trainer) and not self.label_present(self.assets["category"],90,category_y):
+                self.act([{"do":"click","x":540,"y":87}],"Open selected Trainer menu while portal casts")
+                self.wait_label("category",90,category_y)
+        return super().run(trainer)
+
+    def after_exchange_confirmed(self, chapter, trainer):
+        overlap=self._portal_overlap
+        if overlap is not None and (chapter,trainer)==(overlap.chapter,overlap.trainer):
+            self.events[-1]["portal_math_overlap"]=overlap.after_confirmed_exchange(self,chapter,trainer)
+            self.checkpoint("confirmed_and_portaled")
+            self._portal_overlap=None
 
     def checkpoint(self, phase):
         data = {"chapter":self.progress.chapter, "phase":phase,
@@ -73,7 +106,10 @@ class RaceController(FastExchange):
         actual = self.frame[200:250,300:400]
         expected = self.assets[area+"_map"]
         difference = np.abs(actual.astype(np.int16)-expected.astype(np.int16))
-        return difference.max() <= 12 and difference.mean() <= 1
+        # The translucent paper can show a few world pixels underneath.
+        # Inspected suburb frame: 1.64% outliers, mean1.24; wrong city
+        # map: 55.3% outliers, mean16.9. Require near-total paper agreement.
+        return difference.mean() <= 2 and np.count_nonzero(difference > 12) / difference.size <= .025
 
     def wait_for(self, test, seconds, description):
         deadline = time.monotonic()+seconds
@@ -183,6 +219,17 @@ class RaceController(FastExchange):
         for x in range(row.shape[1]-20+1):
             if np.count_nonzero(row[:,x:x+20]!=self.assets["mounted_buff"])<=6:
                 return "mounted"
+        # A different character may have extra timed buffs while on foot.
+        # Use only its explicitly inspected profile row, matching HUD and area.
+        # The generic profile has no such asset and keeps its existing guards.
+        foot_rows=list(self.assets.get("unmounted_buff_rows", []))
+        if "unmounted_buff_row" in self.assets:
+            foot_rows.append(self.assets["unmounted_buff_row"])
+        if any(np.count_nonzero(row!=foot_row)<=6 for foot_row in foot_rows):
+            player=cv2.inRange(self.frame[35:53,93:245],np.array([190]*3),np.array([255]*3))
+            if np.count_nonzero(player!=self.assets["player_name"])<=4:
+                self.area()
+                return "unmounted"
         for x in range(row.shape[1]-20+1):
             if np.count_nonzero(row[:,x:x+20]!=self.assets["xp_buff"])<=6:
                 outside=row.copy()
@@ -262,6 +309,13 @@ class RaceController(FastExchange):
         x,y=TRAINER_HEADS[trainer]
         self.act([{"do":"click","x":x,"y":y}],f"Marathon select Trainer{trainer}")
         self.wait_for(lambda:self.portrait_matches(trainer),12,"Selected NPC was not expected Trainer")
+        if trainer == 10:
+            # This waypoint selects Trainer10 and approaches him without
+            # opening his dialogue. Use the inspected selected-NPC Menu.
+            self.read()
+            if not self.label_present(self.assets["category"],90,226):
+                self.act([{"do":"click","x":540,"y":87}],"Open selected Trainer10 menu")
+                self.wait_label("category",90,226)
 
     def transition(self, destination_area):
         current=self.area()
@@ -362,7 +416,8 @@ class RaceController(FastExchange):
                 self.read()
                 navigation_started=time.monotonic()
                 destination_area="suburb" if trainer<=5 else "city"
-                used_portal=bool(athens_shortcut_leg(current_trainer,trainer) and self.athens_portal_ready())
+                used_portal=bool(athens_shortcut_leg(current_trainer,trainer) and
+                                 not self.at_athens_spawn() and self.athens_portal_ready())
                 if used_portal:
                     self.portal_to_athens()
                 used_transporter=current_trainer==6 and trainer==1
@@ -389,6 +444,9 @@ class RaceController(FastExchange):
                 self.events.append({"chapter":chapter,**result})
                 self.checkpoint("confirmed")
                 self.act([{"do":"click","x":959,"y":163}],"Marathon close verified receipt")
+                after_exchange=getattr(self,"after_exchange_confirmed",None)
+                if after_exchange is not None:
+                    after_exchange(chapter,trainer)
                 current_trainer=trainer
         except Exception as exc:
             self.checkpoint("stopped: "+str(exc))
@@ -439,8 +497,9 @@ def main():
     mode.add_argument("--resume-equation",action="store_true")
     mode.add_argument("--resume-receipt",action="store_true")
     parser.add_argument("--profile",type=Path,default=Path("profiles/godsarena"))
+    parser.add_argument("--overlap-portals",action="store_true",help="opt into ready portal casting during exchanges8/14; both shortcut exchanges verified live")
     args=parser.parse_args()
-    controller=RaceController(GameLensClient("http://127.0.0.1:8777",None),args.profile,args.evidence_dir,args.chapter)
+    controller=RaceController(GameLensClient("http://127.0.0.1:8777",None),args.profile,args.evidence_dir,args.chapter,args.overlap_portals)
     controller.started_at=args.started_at
     if args.start_confirmation:
         controller.start_from_confirmation()

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gamelens-godsarena",
+  "version": "0.1.1",
+  "description": "Saved GodsArena Marathon route, verified shortcuts and fast GameLens continuation.",
+  "author": {"name": "CHUBZ"},
+  "repository": "https://github.com/chubz1436/gamelens",
+  "extensions": {"com.openai": {"interface": {
+    "displayName": "GameLens GodsArena",
+    "shortDescription": "Use the saved Marathon route and lessons",
+    "developerName": "CHUBZ",
+    "category": "Productivity",
+    "capabilities": ["Read", "Interactive"],
+    "defaultPrompt": ["Inspect my current GodsArena Marathon progress", "Use the learned Marathon route for my next authorized run"]
+  }}}
+}

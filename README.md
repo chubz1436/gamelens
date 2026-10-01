@@ -29,6 +29,82 @@ backend    : printwindow   33.0 fps      frame age 16 ms
 
 ## Quick start
 
+### Multiple game clients
+
+After ongoing gameplay finishes, run `./tools/install_multi_client.ps1` to
+configure ten named sessions `client-01` through `client-10` (ports8777–8786) and install
+matching Desktop/Start menu shortcuts. Each app selects its own game window;
+non-default ports appear in the window title. No game or capture starts from
+the installer. Reload Codex, call `gamelens_clients`, then specify `client`
+on state/see/act/recording calls. Input still uses the selected foreground game.
+See [multiple-client usage](docs/MULTI_CLIENTS.md) for configuration and limits.
+
+### Record the selected game
+
+Use **Start recording**, then **Stop recording** in the GameLens window.
+Video-only MP4 files save to `%USERPROFILE%\Videos\GameLens`; **Open recordings
+folder** opens that location. Recording uses the selected capture window at
+30 FPS, works while disarmed, and starts no input. It runs on a separate thread
+and finalizes the file when stopped or when the owning app closes. Capture
+session/size changes stop the clip with a visible message. Audio is not recorded.
+
+### Codex plugins and MCP
+
+The local marketplace packages two plugins: **GameLens** (MCP and native game
+control skill) and **GameLens GodsArena** (saved Marathon route and lessons).
+
+```powershell
+./tools/install_plugins.ps1
+```
+
+Reload Codex after installation. The installer preserves or creates the single
+standalone MCP registration used by the current Codex runtime. Bundled MCP
+configs are included for compatible hosts. It connects to the local GameLens
+app with its encrypted agent capability and exposes `gamelens_state`,
+`gamelens_see`, `gamelens_act`, `gamelens_recording`, `gamelens_session`, and
+read-only `gamelens_profile`. The named-client provider also adds `gamelens_clients`. The profile tool
+works without a running game and cannot read arbitrary paths. The GodsArena
+companion adds the learned workflow without a second MCP connection.
+
+Install starts no capture, input or race. Open GameLens and select the game;
+Owner-authorized agents can Arm/Go live with `gamelens_session`. Plugins require this Windows project and `.venv`.
+Rerun the installer after moving the project. Existing standalone MCP setups
+remain usable; keep only one enabled connection for this same GameLens server.
+
+Sharing the repository for GodsArena Marathon use? Follow the
+[setup and profile-matching guide](docs/SHARED_MARATHON_SETUP.md). Best verified
+clean time is867.060 seconds; other PCs/characters and a700-second run require
+their own live proof.
+
+### Desktop app (Windows)
+
+Install the desktop dependency and shortcuts once:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+./tools/install_desktop.ps1
+```
+
+Open **GameLens** from Desktop or Start menu. It has its own native window;
+Microsoft Edge WebView2 Runtime is required. When no server is running, choose
+the game window and press **Open GameLens**, then **Arm** and **Go live** yourself.
+Closing that app window stops its capture server and releases inputs.
+
+If GameLens is already running on port 8777, the app connects and leaves it
+running when closed. Native desktop login is automatic using a separate
+Windows-encrypted operator handoff, so the app needs no manual token popup.
+Old servers without that handoff attach with agent access until restarted.
+Browser access still requires a token; its popup can be closed. MCP clients
+continue to use agent capability. Owner-authorized agents can Arm/Go live through
+`gamelens_session`; no second owner click is needed. See [agent session controls](docs/AGENT_SESSION.md).
+
+```powershell
+.\.venv\Scripts\pythonw.exe -m gamelens.desktop
+```
+
+The shortcut uses this project's `.venv`; keep the project in its installed
+location or rerun the shortcut installer after moving it. The CLI remains usable.
+
 ```bash
 .venv/Scripts/python.exe -m gamelens --list
 ```
@@ -39,13 +115,14 @@ backend    : printwindow   33.0 fps      frame age 16 ms
 
 GameLens prints two tokens to its console and opens on `http://127.0.0.1:8777/`. Paste the
 **operator** token into the dashboard. Nothing is injected until you press **Arm** and then
-**Go live** — two separate steps, on purpose.
+**Go live**, or an authorized agent calls those two explicit session actions.
 
 **Kill switch: F12 or Pause.** It latches; restart the process to clear it.
 
 For Codex or Claude driving through MCP, use `--no-agent`: no separate paid vision API is
 needed. The dashboard shows the current access role, foreground state, blocked-input reason,
-executor results and snapshot retention. Only the operator can Arm, Go live or Stop.
+executor results and snapshot retention. Authenticated operators and agents can Arm,
+Go live or Stop; startup stays disarmed/dry-run and enabling sends no game input.
 `sent` means input was injected; inspect the next image to confirm the game actually changed.
 
 ## Safety model
@@ -55,9 +132,9 @@ it is *something broke and the system kept clicking anyway*.
 
 - **Dry-run by default.** Actions are logged and drawn on the dashboard overlay, not injected.
   Check that the overlay marks land on the real buttons before going live.
-- **Arming is operator-only.** There are two tokens: the operator token can arm, go live and
-  stop; the agent token can only propose actions. Model output can never grant itself
-  authority.
+- **Session control follows the owner's task.** Both authenticated roles can arm, go live
+  and stop through explicit calls. The agent token remains separate from the operator
+  credential; window enumeration and opening the recordings folder remain operator-only.
 - **Every interlock must pass**, independently: armed, not killed, target window in the
   foreground, within the rate limit, and the watchdog both *alive* and beating recently.
   An exception anywhere inside the guard denies.

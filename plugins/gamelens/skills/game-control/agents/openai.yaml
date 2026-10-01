@@ -1,0 +1,9 @@
+interface:
+  display_name: "GameLens Game Control"
+  short_description: "Inspect and control native games with GameLens"
+  default_prompt: "Use $game-control to inspect my GameLens session and perform my authorized game task."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "gamelens"
+      description: "Local GameLens observation and guarded game input"

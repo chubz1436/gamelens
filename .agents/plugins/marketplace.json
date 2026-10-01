@@ -1,0 +1,8 @@
+{
+  "name": "gamelens-local",
+  "interface": {"displayName": "GameLens Local"},
+  "plugins": [
+    {"name": "gamelens", "source": {"source": "local", "path": "./plugins/gamelens"}, "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"}, "category": "Productivity"},
+    {"name": "gamelens-godsarena", "source": {"source": "local", "path": "./plugins/gamelens-godsarena"}, "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"}, "category": "Productivity"}
+  ]
+}

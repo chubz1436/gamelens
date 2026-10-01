@@ -1,0 +1,4 @@
+interface:
+  display_name: "GodsArena Marathon"
+  short_description: "Reuse the learned Marathon route and shortcuts"
+  default_prompt: "Use $marathon to inspect my GodsArena progress and follow the saved route for my authorized race."

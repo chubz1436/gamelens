@@ -320,6 +320,8 @@ class GameLens:
             self.target, pool_depth=pool_depth, forced=backend
         )
         self.geometry = GeometryTracker(self.target.hwnd)
+        from gamelens.recording import Recorder
+        self.recorder = Recorder(self._recording_frame)
         self.safety = SafetySupervisor(self.target.hwnd, rate=rate)
         self.executor = InputExecutor(self.safety)
         self.arbiter = Arbiter(self.capture, self.geometry, self.executor)
@@ -349,6 +351,12 @@ class GameLens:
         log.info("GameLens ready on %r (hwnd %d)", self.target.title, self.target.hwnd)
 
     def stop(self) -> None:
+        recorder = getattr(self, "recorder", None)
+        if recorder is not None:
+            try:
+                recorder.stop()
+            except ValueError:
+                log.error("Recorder still finishing during shutdown")
         self._stop.set()
         if self._poller:
             self._poller.join(timeout=1.0)
@@ -484,6 +492,17 @@ class GameLens:
         if isinstance(result, Encoded):
             return result.jpeg, result.observation_id
         return None, ""
+
+    def _recording_frame(self):
+        frame = self.capture.frames.acquire(timeout=0)
+        if frame is None:
+            return None
+        try:
+            if not self._from_live_backend(frame) or frame.age() > 0.5:
+                return None
+            return frame.array[:, :, :3].copy(), frame.session_id
+        finally:
+            frame.release()
 
     # --- actions ----------------------------------------------------------
 
@@ -957,6 +976,7 @@ class GameLens:
             "safety": safety,
             "session": session,
             "capabilities": {"anchored_click": "yellow-label-v1", "shared_input": True},
+            "recording": self.recorder.snapshot() if hasattr(self, "recorder") else None,
             "observations": {"retention_seconds": self.observations.retention_seconds,
                              "snapshot_capacity": self.observations._capacity,
                              "stream_retention_seconds": 5.0},

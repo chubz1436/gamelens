@@ -1,0 +1,14 @@
+{
+  "clients": [
+    {"name": "client01", "url": "http://127.0.0.1:8777"},
+    {"name": "client02", "url": "http://127.0.0.1:8778"},
+    {"name": "client03", "url": "http://127.0.0.1:8779"},
+    {"name": "client04", "url": "http://127.0.0.1:8780"},
+    {"name": "client05", "url": "http://127.0.0.1:8781"},
+    {"name": "client06", "url": "http://127.0.0.1:8782"},
+    {"name": "client07", "url": "http://127.0.0.1:8783"},
+    {"name": "client08", "url": "http://127.0.0.1:8784"},
+    {"name": "client09", "url": "http://127.0.0.1:8785"},
+    {"name": "client10", "url": "http://127.0.0.1:8786"}
+  ]
+}
