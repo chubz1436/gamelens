@@ -95,7 +95,7 @@
     <p id="gate-msg"></p>
     <input id="gate-input" type="password" autocomplete="off" spellcheck="false"
            placeholder="paste token">
-    <div class="row" style="margin-top:12px"><button id="gate-save">Unlock</button></div>
+    <div class="row" style="margin-top:12px"><button id="gate-save">Unlock</button><button id="gate-close">Close</button></div>
   </div>
 </div>
 
@@ -107,6 +107,17 @@
 
   <aside>
     <div class="card">
+      <h2>Video recording</h2>
+      <div class="row">
+        <button id="btn-record">Start recording</button>
+        <button id="btn-record-stop">Stop recording</button>
+      </div>
+      <p id="s-recording" role="status" aria-live="polite">Not recording</p>
+      <p class="note">Selected game window · MP4 · 30 FPS · No audio</p>
+      <p class="note" id="s-record-file" style="overflow-wrap:anywhere"></p>
+      <button id="btn-record-folder">Open recordings folder</button>
+    </div>
+    <div class="card">
       <h2>Control</h2>
       <div class="row">
         <button id="btn-arm">Arm</button>
@@ -117,6 +128,7 @@
         The kill key latches until restart.</p>
       <p id="s-session" role="status" aria-live="polite">Connecting…</p>
       <p id="s-control-error" role="alert"></p>
+      <button id="btn-access">Change access</button>
       <p class="note">Live input uses your shared mouse and keyboard. Keep the game in front.</p>
     </div>
 
@@ -188,6 +200,9 @@ function showGate(message) {
 }
 
 function hideGate() { $('gate').style.display = 'none'; }
+$('gate-close').onclick = hideGate;
+
+$('btn-access').onclick = () => showGate('Paste your session token to connect.');
 
 $('gate-save').onclick = () => {
   const v = $('gate-input').value.trim();
@@ -339,9 +354,18 @@ async function tick() {
     $('p-target').title = s.target ? s.target.title : '';
     $('s-session').textContent = s.session ? s.session.message : 'Waiting for session status.';
     const operator = s.role === 'operator';
-    $('btn-arm').disabled = !operator || s.safety.killed || s.safety.armed;
-    $('btn-live').disabled = !operator || s.safety.killed || !s.safety.armed || !s.safety.dry_run;
-    $('btn-stop').disabled = !operator || s.safety.killed;
+    const sessionControl = operator || s.role === 'agent';
+    const recording = s.recording;
+    $('btn-record').disabled = !operator || !recording || recording.active || !s.capture.healthy;
+    $('btn-record-stop').disabled = !operator || !recording || !recording.active;
+    $('btn-record-folder').disabled = !operator || !recording;
+    $('s-recording').textContent = !recording ? 'Recording unavailable: restart GameLens to update.' :
+      recording.error || (recording.active ? 'Recording · ' + recording.seconds.toFixed(1) + ' s' :
+        recording.file ? 'Saved · ' + recording.seconds.toFixed(1) + ' s' : 'Not recording');
+    $('s-record-file').textContent = recording ? (recording.file || recording.folder) : '';
+    $('btn-arm').disabled = !sessionControl || s.safety.killed || s.safety.armed;
+    $('btn-live').disabled = !sessionControl || s.safety.killed || !s.safety.armed || !s.safety.dry_run;
+    $('btn-stop').disabled = !sessionControl || s.safety.killed;
     $('s-role').textContent = s.role || '--';
     $('s-retention').textContent = s.observations ? s.observations.retention_seconds + ' s' : '--';
     const executor = s.safety.executor || {};
@@ -367,7 +391,7 @@ async function tick() {
   } catch (err) {
     pill($('p-target'), 'server down', 'hot');
     $('s-session').textContent = 'Connection lost. Check GameLens before acting.';
-    ['btn-arm', 'btn-live', 'btn-stop'].forEach(id => $(id).disabled = true);
+    ['btn-arm', 'btn-live', 'btn-stop', 'btn-record', 'btn-record-stop', 'btn-record-folder'].forEach(id => $(id).disabled = true);
   }
 }
 
@@ -385,6 +409,9 @@ const post = async (path) => {
 $('btn-arm').onclick  = () => post('/arm');
 $('btn-live').onclick = () => post('/live');
 $('btn-stop').onclick = () => post('/stop');
+$('btn-record').onclick = () => post('/recording/start');
+$('btn-record-stop').onclick = () => post('/recording/stop');
+$('btn-record-folder').onclick = () => post('/recording/folder');
 
 setInterval(tick, 400);
 tick();

@@ -19,6 +19,7 @@ from gamelens.app import GameLens
 from gamelens.capture import Backend
 from gamelens.server import create_app
 from gamelens.session import agent_token_path, clear_agent_token, publish_agent_token
+from gamelens.session import operator_token_path, clear_operator_token, publish_operator_token
 from gamelens.windows import AmbiguousTarget, find_window, list_windows
 
 
@@ -140,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     token_path = agent_token_path(args.port)
     try:
         publish_agent_token(token_path, lens.tokens.agent)
+        publish_operator_token(operator_token_path(args.port), lens.tokens.operator)
     except Exception:
         lens.stop()
         raise
@@ -157,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         lens.stop()
         clear_agent_token(token_path, lens.tokens.agent)
+        clear_operator_token(operator_token_path(args.port), lens.tokens.operator)
     return 0
 
 

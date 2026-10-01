@@ -33,6 +33,8 @@ class Stub:
         self.frame_status = 200
         self.after_status = 200
         self.drop_frames = False
+        self.recording_active = False
+        self.session_safety = {"armed": True, "dry_run": True, "killed": False}
         self.n = 0
         stub = self
 
@@ -52,8 +54,10 @@ class Stub:
             def do_GET(self):
                 stub.requests.append(("GET", self.path, None, self.headers.get("X-GameLens-Token")))
                 if self.path == "/state":
-                    self._send(200, json.dumps({"safety": {"armed": True}, "log": [1] * 50,
+                    self._send(200, json.dumps({"safety": stub.session_safety, "log": [1] * 50,
                                                 "marks": [1]}).encode())
+                elif self.path == "/recording":
+                    self._send(200, json.dumps({"active": stub.recording_active}).encode())
                 elif self.path.startswith("/frame.jpg"):
                     if stub.drop_frames:
                         self.close_connection = True      # hang up: no response at all
@@ -73,6 +77,30 @@ class Stub:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length))
                 stub.requests.append(("POST", self.path, body, self.headers.get("X-GameLens-Token")))
+                if self.path in ("/arm", "/live", "/stop"):
+                    safety = stub.session_safety
+                    if self.path != "/stop" and (safety["killed"] or (self.path == "/live" and not safety["armed"])):
+                        self._send(409, b'{"detail":"session interlock"}')
+                        return
+                    if self.path == "/arm":
+                        safety["armed"] = True
+                    elif self.path == "/live":
+                        safety["dry_run"] = False
+                    else:
+                        safety.update(armed=False, dry_run=True, killed=True)
+                    self._send(200, json.dumps({"safety": safety, "log": ["session log"]}).encode())
+                    return
+                if self.path == "/recording/start":
+                    if stub.recording_active:
+                        self._send(409, b'{"detail":"Recording already active"}')
+                    else:
+                        stub.recording_active = True
+                        self._send(200, json.dumps({"active": True, "fps": body["fps"]}).encode())
+                    return
+                if self.path == "/recording/stop":
+                    stub.recording_active = False
+                    self._send(200, b'{"active":false}')
+                    return
                 self._send(stub.act_status, json.dumps(stub.act_body).encode())
 
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -171,8 +199,50 @@ def test_an_unknown_protocol_version_gets_the_newest_supported(stub):
 
 def test_tools_are_listed_with_schemas(client):
     tools = {t["name"]: t for t in client.call("tools/list")["result"]["tools"]}
-    assert set(tools) == {"gamelens_state", "gamelens_see", "gamelens_act"}
+    assert set(tools) == {"gamelens_state", "gamelens_see", "gamelens_act", "gamelens_profile", "gamelens_recording", "gamelens_session"}
     assert tools["gamelens_act"]["inputSchema"]["required"] == ["action"]
+
+
+def test_explicit_session_controls_through_stdio_without_game_input(client, stub):
+    stub.session_safety["armed"] = False
+    assert not client.tool("gamelens_session", {"action": "status"})["isError"]
+    assert client.tool("gamelens_session", {"action": "live"})["isError"]
+    for action in ("arm", "live", "stop"):
+        result = client.tool("gamelens_session", {"action": action})
+        assert not result["isError"]
+        assert "log" not in json.loads(result["content"][0]["text"])
+    assert client.tool("gamelens_session", {"action": "arm"})["isError"]
+    assert stub.paths() == ["GET /state", "POST /live", "POST /arm", "POST /live", "POST /stop", "POST /arm"]
+    assert stub.acts() == []
+    assert all(token == "agent-token" for _, _, _, token in stub.requests)
+
+
+@pytest.mark.parametrize("args", [{}, {"action": "reset"}, {"action": "/arm"}, {"action": "arm", "path": "/windows"}, {"action": "live", "target": 1}])
+def test_invalid_session_control_sends_nothing(client, stub, args):
+    assert client.tool("gamelens_session", args)["isError"]
+    assert stub.paths() == []
+
+
+def test_uncertain_session_control_is_not_retried():
+    from gamelens.mcp import GameLensClient, ToolError
+    c = GameLensClient("http://127.0.0.1:8777", None)
+    calls = []
+    def fail(path, body=None):
+        calls.append(path)
+        raise ToolError("response lost")
+    c.request = fail
+    with pytest.raises(ToolError, match="outcome unknown.*Check session status"):
+        c.tool_session({"action": "live"})
+    assert calls == ["/live"]
+
+
+@pytest.mark.parametrize("body", [b"not-json", b"{}", b'{"safety":{"armed":true}}'])
+def test_session_response_must_prove_usable_safety_state(body):
+    from gamelens.mcp import GameLensClient, ToolError
+    c = GameLensClient("http://127.0.0.1:8777", None)
+    c.request = lambda *args: (200, body, {})
+    with pytest.raises(ToolError, match="check session status"):
+        c.tool_session({"action": "arm"})
 
 
 def test_ping_and_unknown_methods(client):
@@ -197,6 +267,50 @@ def test_state_drops_the_dashboard_log_and_uses_the_agent_token(client, stub):
     state = json.loads(texts(result))
     assert state["safety"]["armed"] is True and "log" not in state and "marks" not in state
     assert stub.requests[-1][3] == "agent-token"
+
+
+def test_recording_status_start_stop_use_agent_auth_and_no_game_input(client, stub):
+    assert json.loads(texts(client.tool("gamelens_recording", {"action": "status"}))) == {"active": False}
+    started = client.tool("gamelens_recording", {"action": "start"})
+    assert not started["isError"]
+    assert json.loads(texts(started)) == {"active": True, "fps": 30}
+    duplicate = client.tool("gamelens_recording", {"action": "start"})
+    assert duplicate["isError"] and "409" in texts(duplicate)
+    assert "already active" in texts(duplicate)
+    stopped = client.tool("gamelens_recording", {"action": "stop"})
+    assert not stopped["isError"] and json.loads(texts(stopped)) == {"active": False}
+    assert stub.paths() == ["GET /recording", "POST /recording/start", "POST /recording/start", "POST /recording/stop"]
+    assert all(token == "agent-token" for _, _, _, token in stub.requests)
+    assert not stub.acts()
+
+
+@pytest.mark.parametrize("fps", [15, 30, 60])
+def test_recording_fps_is_forwarded(client, stub, fps):
+    assert not client.tool("gamelens_recording", {"action": "start", "fps": fps})["isError"]
+    assert stub.requests == [("POST", "/recording/start", {"fps": fps}, "agent-token")]
+
+
+@pytest.mark.parametrize("arguments", [
+    {}, {"action": "open"}, {"action": "start", "folder": "C:/secret"},
+    {"action": "start", "fps": True}, {"action": "start", "fps": 24},
+    {"action": "start", "fps": "30"}, {"action": "status", "fps": 30},
+    {"action": "stop", "fps": 30}, {"action": "start", "path": "C:/secret"},
+])
+def test_recording_invalid_args_send_no_http(client, stub, arguments):
+    assert client.tool("gamelens_recording", arguments)["isError"]
+    assert not stub.requests
+
+
+def test_recording_transport_failure_does_not_retry(monkeypatch):
+    from gamelens.mcp import GameLensClient, ToolError
+    from unittest.mock import Mock
+
+    transport = Mock(side_effect=ToolError("connection lost"))
+    client = GameLensClient("http://127.0.0.1:8777", None)
+    monkeypatch.setattr(client, "request", transport)
+    with pytest.raises(ToolError, match="outcome unknown.*Check recording status"):
+        client.tool_recording({"action": "start"})
+    transport.assert_called_once_with("/recording/start", {"fps": 30})
 
 
 def test_see_returns_the_image(client):

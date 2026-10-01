@@ -1,0 +1,25 @@
+{
+  "skills": "./skills/",
+  "author": {
+    "name": "CHUBZ"
+  },
+  "interface": {
+    "displayName": "GameLens",
+    "shortDescription": "See and control your native game window",
+    "developerName": "CHUBZ",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Check my GameLens session and inspect the game",
+      "Use GameLens for my authorized game task"
+    ]
+  },
+  "version": "0.1.3",
+  "description": "Native Windows game observation and guarded control through the local GameLens app.",
+  "mcpServers": "./.mcp.json",
+  "name": "gamelens"
+}

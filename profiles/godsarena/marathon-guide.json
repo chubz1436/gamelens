@@ -1,0 +1,223 @@
+{
+  "profile": "godsarena-marathon",
+  "calibrated_on": "2026-10-01",
+  "game": "GodsArena Elysium EU",
+  "geometry": {
+    "width": 1026,
+    "height": 800
+  },
+  "character": "CHUBZ level 140 Warrior",
+  "evidence": {
+    "best_clean_seconds": 867.06,
+    "owner_accepted": true,
+    "original_target_seconds": 700,
+    "original_target_achieved": false
+  },
+  "chapter_destinations": [
+    3,
+    4,
+    5,
+    3,
+    2,
+    4,
+    3,
+    1,
+    6,
+    7,
+    9,
+    10,
+    9,
+    8,
+    7,
+    6,
+    1
+  ],
+  "controls": {
+    "map": "m",
+    "bag": "b",
+    "skills": "s",
+    "quests": "q",
+    "riding": "7",
+    "portal_athens": "2",
+    "portal_marathon": "3"
+  },
+  "trainers": {
+    "1": {
+      "area": "suburb",
+      "map": [
+        498,
+        532
+      ],
+      "gps": [
+        90,
+        -129
+      ],
+      "npc": [
+        583,
+        275
+      ]
+    },
+    "2": {
+      "area": "suburb",
+      "map": [
+        659,
+        463
+      ],
+      "gps": [
+        203,
+        167
+      ],
+      "npc": [
+        467,
+        359
+      ]
+    },
+    "3": {
+      "area": "suburb",
+      "map": [
+        541,
+        451
+      ],
+      "gps": [
+        41,
+        29
+      ],
+      "npc": [
+        481,
+        377
+      ]
+    },
+    "4": {
+      "area": "suburb",
+      "map": [
+        528,
+        292
+      ],
+      "gps": [
+        -178,
+        227
+      ],
+      "npc": [
+        533,
+        369
+      ]
+    },
+    "5": {
+      "area": "suburb",
+      "map": [
+        363,
+        451
+      ],
+      "gps": [
+        -179,
+        -192
+      ],
+      "npc": [
+        580,
+        377
+      ]
+    },
+    "6": {
+      "area": "city",
+      "map": [
+        578,
+        492
+      ],
+      "gps": [
+        140,
+        22
+      ],
+      "npc": [
+        592,
+        397
+      ]
+    },
+    "7": {
+      "area": "city",
+      "map": [
+        531,
+        571
+      ],
+      "gps": [
+        179,
+        -138
+      ],
+      "npc": [
+        443,
+        322
+      ]
+    },
+    "8": {
+      "area": "city",
+      "map": [
+        415,
+        489
+      ],
+      "gps": [
+        -65,
+        -176
+      ],
+      "npc": [
+        171,
+        361
+      ]
+    },
+    "9": {
+      "area": "city",
+      "map": [
+        475,
+        424
+      ],
+      "gps": [
+        -74,
+        -19
+      ],
+      "npc": [
+        286,
+        395
+      ]
+    },
+    "10": {
+      "area": "city",
+      "map": [
+        429,
+        454
+      ],
+      "gps": [
+        -93,
+        -114
+      ],
+      "npc": [
+        311,
+        278
+      ]
+    }
+  },
+  "shortcuts": [
+    "Trainer2 -> Trainer4: mounted detour map600,451 avoids the market block; then Trainer4. Full leg observed86.856s instead of102.526s.",
+    "Trainer1 ->6 and Trainer8 ->7: learned Portal Athens slot2 only when ready. Dismount7, confirm foot, cast2 once, confirm city spawn150,-150, wait2.3s global cooldown plus ready Riding, remount7 once and confirm completed cast. Otherwise known walking route.",
+    "Trainer6 ->1: free Transporter. Search900,230 -> Transfer(Location)887,291 -> GPS169,-39 -> NPC477,334 and portrait. Transmit124,237 -> Suburbs destination515,289 -> OK850,407. Mounted spawn120,-200; mapTrainer1 and confirm portrait. Observed full exchange35.140s.",
+    "Trainer8 ->7 portal plus exchange observed28.281s; whole-race <=700 is unverified.",
+    "Opt-in --overlap-portals: during Manual8 atTrainer1 / Manual14 atTrainer8, dismount, castPortalAthens while answering math. Dismount closes NPCmenu; reopen with selected NPC HUD Menu540,87 without groundmovement. Verify actual receipt before advancing; verify Athensspawn and remount. Live8->7 proof: cast-to-receipt3.360s,cast-to-mounted15.391s. Live1->6 proof on Atong69: cast-to-receipt3.313s,cast-to-mounted15.625s. When portal is not ready, use normal exchange/navigation. HUD Menu can open a context menu; confirm actual race dialogue before exchange."
+  ],
+  "guards": [
+    "This is saved calibration, not current character state or permission to start a race. Read fresh state/see before input; verify geometry, area, target and NPC portrait.",
+    "Advance chapter only after the actual old/new Manual receipt. Final completion needs actual time/reward receipt.",
+    "Daily maximum6 races: when NPC says already completed/come back tomorrow, stop before Start. Reset time was not established.",
+    "Right click casts the selected skill. Use left click for ground movement.",
+    "Mount buff icons shift and XP Orb expires. Require actual mount proof. Cooldown/unknown states do not authorize repeating a cast.",
+    "A denied sequence may have executed partly. Inspect fresh state; never replay the whole batch.",
+    "No portal scrolls were purchased or consumed. Shop quote7BGold each is historical; purchase requires task authority and fresh quote. No untested scroll shortcut is integrated.",
+    "Portal Marathon spawn15,-27 and physical Suburbs exit-200,63 are not a useful proven race shortcut. Trainer7 ->515,565 ->9 was slower and rejected.",
+    "F12/Pause is the GameLens emergency kill switch; do not use F12 as a game shortcut. Shared foreground mouse and keyboard remain in use."
+  ],
+  "runner": "python -m gamelens.marathon_race --start --evidence-dir NEW_DIRECTORY",
+  "continuation": "Read latest progress.json and frame for an interrupted run. Preserve original started_at; resume-equation/resume-receipt only for the verified matching live chapter. Never repeat Start after it was sent.",
+  "latest_recorded_run": {
+    "character": "Atong69",
+    "seconds": 2983.035,
+    "reward_bgold": 1200,
+    "clean": false,
+    "repair_pauses_included": true
+  }
+}

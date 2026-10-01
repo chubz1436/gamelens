@@ -364,3 +364,30 @@ def test_unmounted_without_xp_requires_bare_row_and_known_hud(tmp_path):
     frame[64:85,740:750]=255
     with pytest.raises(UnknownScreen):
         controller.mount_state()
+
+
+def test_other_character_inspected_foot_buffs_require_its_hud_and_area(tmp_path):
+    import cv2
+    frame=np.zeros((800,1026,3),np.uint8)
+    frame[64:85,731:818]=cv2.imread("tests/fixtures/godsarena/atong-foot-row.png")
+    frame[35:53,93:245]=cv2.imread("tests/fixtures/godsarena/atong-player-name.png")
+    controller=RaceController(FakeClient(frame),Path("profiles/godsarena"),tmp_path)
+    controller.frame=frame
+    controller.assets["unmounted_buff_row"]=cv2.inRange(frame[64:85,731:818],np.array([190]*3),np.array([255]*3))
+    controller.assets["player_name"]=cv2.inRange(frame[35:53,93:245],np.array([190]*3),np.array([255]*3))
+    frame[35:54,877:1014]=controller.assets["suburb_title"][:,:,None]
+    assert controller.mount_state()=="unmounted"
+    frame[64:85,731:818]=cv2.imread("tests/fixtures/godsarena/atong-mounted-row.png")
+    assert controller.mount_state()=="mounted"
+    frame[64:85,731:818]=cv2.imread("tests/fixtures/godsarena/atong-foot-row.png")
+    frame[35:53,93:245]=0
+    with pytest.raises(UnknownScreen):
+        controller.mount_state()
+    frame[35:53,93:245]=cv2.imread("tests/fixtures/godsarena/atong-player-name.png")
+    foot=cv2.imread("tests/fixtures/godsarena/atong-city-foot-no-xp.png")
+    controller.assets["unmounted_buff_rows"]=np.array([cv2.inRange(foot,np.array([190]*3),np.array([255]*3))])
+    frame[64:85,731:818]=foot
+    assert controller.mount_state()=="unmounted"
+    frame[35:54,877:1014]=0
+    with pytest.raises(UnknownScreen):
+        controller.mount_state()

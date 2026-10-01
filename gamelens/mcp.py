@@ -3,8 +3,8 @@
     python -m gamelens.mcp [--url http://127.0.0.1:8777] [--token-file PATH]
 
 A stdio MCP server that is an HTTP *client* of a running GameLens. It holds the
-agent token and nothing else: it never calls /arm, /live, /stop or /windows, and
-the server would refuse it if it did. Arming stays with the operator.
+agent token and nothing else. Owner-authorized session control explicitly calls
+/arm, /live or /stop; window enumeration and operator credentials stay separate.
 
 Why it exists (GL-039). Driving GameLens from an agent meant three HTTP round
 trips per primitive -- fetch a frame for its observation id, POST /act, fetch
@@ -45,7 +45,7 @@ from gamelens.session import agent_token_path, read_agent_token
 log = logging.getLogger("gamelens.mcp")
 
 SERVER_NAME = "gamelens"
-SERVER_VERSION = "0.46.0"
+SERVER_VERSION = "0.49.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 10.0
 
@@ -83,9 +83,52 @@ ACTION_SCHEMA = {
 
 TOOLS = [
     {
+        "name": "gamelens_session",
+        "description": (
+            "Check or explicitly enable the selected GameLens session for an owner-authorized game task. "
+            "Use status first to verify target/capture, then arm, then live as separate calls. "
+            "Startup remains disarmed/dry-run. This never focuses the game or sends game input. "
+            "stop latches emergency stop and releases held inputs; arm/live cannot clear that latch. "
+            "On an uncertain response inspect status; never blindly retry."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["status", "arm", "live", "stop"]},
+        }, "required": ["action"], "additionalProperties": False},
+        "annotations": {"openWorldHint": False},
+    },
+    {
+        "name": "gamelens_recording",
+        "description": (
+            "Check, start or stop video recording of the selected GameLens capture window. "
+            "Use start at the beginning of an owner-authorized Marathon and stop on finish "
+            "or interruption. Video only, no audio; default 30fps. This never arms, goes "
+            "live, focuses the game or sends game input. Duplicate start is an error. "
+            "If a request fails, check status before deciding; never blindly retry."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["status", "start", "stop"]},
+            "fps": {"type": "integer", "enum": [15, 30, 60], "default": 30,
+                    "description": "Only for action=start."},
+        }, "required": ["action"], "additionalProperties": False},
+        "annotations": {"openWorldHint": False},
+    },
+    {
+        "name": "gamelens_profile",
+        "description": (
+            "Read the saved GodsArena Marathon route, calibrated controls, shortcuts "
+            "and completion evidence without game input or a running capture server. "
+            "Historical calibration is guidance; verify current state before acting."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "profile": {"type": "string", "enum": ["godsarena-marathon"],
+                        "default": "godsarena-marathon"},
+        }, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    {
         "name": "gamelens_state",
-        "description": ("GameLens status: whether it is armed and live (the operator's "
-                        "switches, which this tool cannot change), kill switch, capture "
+        "description": ("GameLens status: whether it is armed and live (change explicitly "
+                        "with gamelens_session for an authorized task), kill switch, capture "
                         "backend and fps, target window, executor counters."),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -160,8 +203,8 @@ class GameLensClient:
         except Exception:
             raise ToolError(
                 f"no agent token: session at {path} is missing or unreadable. Start python -m gamelens "
-                "--target <game> --no-agent. The operator uses Arm / Go live; "
-                "these agent tools cannot. Explicit GAMELENS_AGENT_TOKEN or "
+                "--target <game> --no-agent. For an owner-authorized task use gamelens_session "
+                "arm then live after inspecting the target. Explicit GAMELENS_AGENT_TOKEN or "
                 "--token-file is also supported.") from None
 
     def request(self, path: str, body: dict | None = None):
@@ -212,6 +255,34 @@ class GameLensClient:
 
     # --- tools ----------------------------------------------------------------
 
+    def tool_session(self, args: dict) -> tuple[list, bool]:
+        action = args.get("action")
+        if set(args) != {"action"} or action not in ("status", "arm", "live", "stop"):
+            raise ToolError("Session action must be status, arm, live or stop; no reset or arbitrary paths")
+        if action == "status":
+            return self.tool_state({})
+        try:
+            status, body, _ = self.request("/" + action, {})
+        except ToolError as exc:
+            raise ToolError(f"Session {action} outcome unknown: {exc}. Check session status before deciding; do not blindly retry") from exc
+        if status != 200:
+            raise ToolError(f"/{action} answered HTTP {status}: {_detail(body)}")
+        try:
+            state = json.loads(body)
+        except ValueError:
+            raise ToolError("Session response unreadable; check session status before deciding") from None
+        if not isinstance(state, dict) or not isinstance(state.get("safety"), dict):
+            raise ToolError("Session response missing safety state; check session status before deciding")
+        safety = state["safety"]
+        if any(not isinstance(safety.get(key), bool) for key in ("armed", "dry_run", "killed")):
+            raise ToolError("Session response has incomplete safety state; check session status before deciding")
+        confirmed = (safety["killed"] if action == "stop" else
+                     safety["armed"] and not safety["killed"] and
+                     (action != "live" or not safety["dry_run"]))
+        for key in ("log", "marks"):
+            state.pop(key, None)
+        return [{"type": "text", "text": json.dumps(state, indent=1)}], not confirmed
+
     def tool_state(self, args: dict) -> tuple[list, bool]:
         status, body, _ = self.request("/state")
         if status != 200:
@@ -228,6 +299,35 @@ class GameLensClient:
         if problem:
             raise ToolError(problem)
         return content, False
+
+    def tool_recording(self, args: dict) -> tuple[list, bool]:
+        action = args.get("action")
+        if set(args) - {"action", "fps"} or action not in ("status", "start", "stop"):
+            raise ToolError("Recording action must be status, start or stop; arbitrary paths are not supported")
+        if action != "start" and "fps" in args:
+            raise ToolError("fps is only supported for recording start")
+        payload = None
+        path = "/recording"
+        if action == "start":
+            fps = args.get("fps", 30)
+            if isinstance(fps, bool) or not isinstance(fps, int) or fps not in (15, 30, 60):
+                raise ToolError("fps must be 15, 30 or 60")
+            path, payload = "/recording/start", {"fps": fps}
+        elif action == "stop":
+            path, payload = "/recording/stop", {}
+        try:
+            status, body, _ = self.request(path, payload)
+        except ToolError as exc:
+            if action != "status":
+                raise ToolError(f"Recording {action} outcome unknown: {exc}. Check recording status before deciding; do not blindly retry") from exc
+            raise
+        if status != 200:
+            raise ToolError(f"{path} answered HTTP {status}: {_detail(body)}")
+        try:
+            result = json.loads(body)
+        except ValueError:
+            raise ToolError("Recording response was unreadable; check recording status before deciding") from None
+        return [{"type": "text", "text": json.dumps(result, indent=1)}], False
 
     def tool_act(self, args: dict) -> tuple[list, bool]:
         action = args.get("action")
@@ -383,10 +483,25 @@ def _bounded(args: dict, key: str, default: int, lo: int, hi: int) -> int:
 # --- JSON-RPC over stdio -------------------------------------------------------
 
 
+def tool_profile(args: dict):
+    if set(args) - {"profile"} or args.get("profile", "godsarena-marathon") != "godsarena-marathon":
+        raise ToolError("Unknown profile. Available: godsarena-marathon")
+    # Fixed curated file only: callers cannot request arbitrary local paths.
+    path = Path(__file__).resolve().parent.parent / "profiles" / "godsarena" / "marathon-guide.json"
+    try:
+        guide = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ToolError("Saved Marathon guide is unavailable in this GameLens installation") from None
+    return [{"type": "text", "text": json.dumps(guide, ensure_ascii=False)}], False
+
+
 class Server:
     def __init__(self, client: GameLensClient) -> None:
         self.client = client
         self.handlers = {
+            "gamelens_session": client.tool_session,
+            "gamelens_recording": client.tool_recording,
+            "gamelens_profile": tool_profile,
             "gamelens_state": client.tool_state,
             "gamelens_see": client.tool_see,
             "gamelens_act": client.tool_act,
@@ -420,7 +535,7 @@ class Server:
                     "actions still use the original short freshness limits. Rebind checks "
                     "session, geometry and point pixels. A denial returns a new image: "
                     "inspect it and decide again, never blindly retry. sent means injected, "
-                    "not proof of game effect. The operator arms/goes live; tools cannot. "
+                    "not proof of game effect. For an owner-authorized task use gamelens_session status, arm, then live. "
                     "Live input uses the shared foreground mouse/keyboard."),
             })
         if method == "ping":

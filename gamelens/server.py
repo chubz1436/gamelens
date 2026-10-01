@@ -376,20 +376,66 @@ def create_app(runtime) -> FastAPI:
 
     # --- control paths ----------------------------------------------------
 
+    @app.get("/recording")
+    def recording_state(role: str = Depends(any_role)) -> JSONResponse:
+        recorder = getattr(runtime, "recorder", None)
+        if recorder is None:
+            raise HTTPException(503, "Recording is unavailable in this runtime")
+        return JSONResponse(recorder.snapshot())
+
+    @app.post("/recording/start")
+    def recording_start(body: dict | None = None, role: str = Depends(any_role)) -> JSONResponse:
+        recorder = getattr(runtime, "recorder", None)
+        if recorder is None:
+            raise HTTPException(503, "Recording is unavailable in this runtime")
+        try:
+            return JSONResponse(recorder.start((body or {}).get("fps", 30)))
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @app.post("/recording/stop")
+    def recording_stop(role: str = Depends(any_role)) -> JSONResponse:
+        recorder = getattr(runtime, "recorder", None)
+        if recorder is None:
+            raise HTTPException(503, "Recording is unavailable in this runtime")
+        try:
+            return JSONResponse(recorder.stop())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @app.post("/recording/folder")
+    def recording_folder(role: str = Depends(operator_only)) -> JSONResponse:
+        recorder = getattr(runtime, "recorder", None)
+        if recorder is None:
+            raise HTTPException(503, "Recording is unavailable in this runtime")
+        try:
+            recorder.open_folder()
+        except OSError:
+            raise HTTPException(409, "Could not open the recordings folder") from None
+        return JSONResponse({"folder": str(recorder.directory)})
+
     @app.post("/arm")
-    def arm(role: str = Depends(operator_only)) -> JSONResponse:
-        runtime.safety.arm()
-        runtime.log.add("ARMED (still dry-run)", "dry")
+    def arm(role: str = Depends(any_role)) -> JSONResponse:
+        from gamelens.safety import NotPermitted
+        try:
+            runtime.safety.arm()
+        except NotPermitted as exc:
+            raise HTTPException(409, str(exc)) from None
+        runtime.log.add(f"ARMED by {role}", "dry")
         return JSONResponse(runtime.state())
 
     @app.post("/live")
-    def live(role: str = Depends(operator_only)) -> JSONResponse:
-        runtime.safety.go_live()
-        runtime.log.add("LIVE -- input will be injected", "sent")
+    def live(role: str = Depends(any_role)) -> JSONResponse:
+        from gamelens.safety import NotPermitted
+        try:
+            runtime.safety.go_live()
+        except NotPermitted as exc:
+            raise HTTPException(409, str(exc)) from None
+        runtime.log.add(f"LIVE by {role} -- input will be injected", "sent")
         return JSONResponse(runtime.state())
 
     @app.post("/stop")
-    def stop(role: str = Depends(operator_only)) -> JSONResponse:
+    def stop(role: str = Depends(any_role)) -> JSONResponse:
         """The one endpoint whose latency is a safety property.
 
         Sync on purpose, so it is served from a worker thread. It also takes the
@@ -397,8 +443,8 @@ def create_app(runtime) -> FastAPI:
         -- none of that belongs on the loop that has to stay free to accept the
         request in the first place.
         """
-        runtime.safety.kill("dashboard stop")
-        runtime.log.add("STOPPED by operator", "denied")
+        runtime.safety.kill(f"session stop by {role}")
+        runtime.log.add(f"STOPPED by {role}", "denied")
         return JSONResponse(runtime.state())
 
     @app.post("/act")
