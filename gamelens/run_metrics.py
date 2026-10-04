@@ -252,6 +252,12 @@ class RunMetrics:
         return self._event(run_id, 'video', {'video_id': identifier(video_id), 'reference': video_reference(reference),
                                            'start_seconds': start, 'end_seconds': end})
 
+    def has_run(self, run_id):
+        """Cheap live-ID check for hosts resuming after bounded idle retention."""
+        with self._lock:
+            self._prune(self._monotonic())
+            return run_id in self._runs
+
     def snapshot(self, run_id=None):
         with self._lock:
             self._prune(self._monotonic())

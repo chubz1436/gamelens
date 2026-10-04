@@ -157,3 +157,42 @@ def test_temporary_creation_is_exclusive_and_collision_preserves_foreign_file(tm
         propose(s)
     assert foreign.read_text() == 'preserve'
     assert s.list_proposals() == []
+
+def test_repeated_activation_is_idempotent_and_rejection_always_works(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    p = propose(s)
+    s.review(p['id'], p['candidate_hash'], 'approve', 'owner')
+    first = s.activate(p['id'], p['candidate_hash'], 'owner')
+    for _ in range(150):
+        assert s.activate(p['id'], p['candidate_hash'], 'owner') == first
+    assert len(s.get(p['id'])['history']) == 2
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', 'owner')
+    assert not rejected['active']
+    assert s.active_candidates() == []
+    persisted = json.loads(path.read_text())[p['id']]
+    assert persisted['review']['decision'] == 'reject'
+    assert persisted['active'] is False
+    assert ReviewedLearningStore(path).get(p['id'])['history'][-1]['decision'] == 'reject'
+
+def test_full_transition_history_retains_latest_rejection(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    p = propose(s)
+    for _ in range(100):
+        s.review(p['id'], p['candidate_hash'], 'approve', 'owner')
+    assert len(s.get(p['id'])['history']) == 100
+    s.activate(p['id'], p['candidate_hash'], 'owner')
+    assert len(s.get(p['id'])['history']) == 100
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', 'owner', 'Revoke at capacity')
+    assert len(rejected['history']) == 100
+    assert rejected['history'][-1]['decision'] == 'reject'
+    assert rejected['history'][-1]['notes'] == 'Revoke at capacity'
+    assert s.active_candidates() == []
+    persisted = json.loads(path.read_text())[p['id']]
+    assert persisted['active'] is False
+    assert persisted['review']['decision'] == 'reject'
+    loaded = ReviewedLearningStore(path)
+    assert loaded.active_candidates() == []
+    assert loaded.get(p['id'])['history'][-1]['decision'] == 'reject'
+    assert loaded.get(p['id'])['proposal'] == p['proposal']

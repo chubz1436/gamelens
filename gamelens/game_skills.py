@@ -36,6 +36,34 @@ def _keys(data: dict, allowed: set[str]) -> None:
 
 
 @dataclass(frozen=True)
+class ProfilePin:
+    """Exact reviewed profile content, independent of a reusable profile ID."""
+    profile_id: str
+    version: str
+    sha256: str
+
+    def __post_init__(self):
+        _text(self.profile_id, "profile_id")
+        _text(self.version, "profile version")
+        if not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("profile sha256 must be a lowercase SHA256 digest")
+
+    def to_dict(self):
+        return {"profile_id": self.profile_id, "version": self.version, "sha256": self.sha256}
+
+    @classmethod
+    def from_dict(cls, data):
+        _keys(data, {"profile_id", "version", "sha256"})
+        return cls(**data)
+
+
+def profile_content_hash(profile_data: dict) -> str:
+    """Hash the exact canonical profile snapshot reviewed by the trusted host."""
+    if not isinstance(profile_data, dict):
+        raise ValueError("profile content must be a JSON object")
+    return hashlib.sha256(_json(profile_data).encode()).hexdigest()
+
+@dataclass(frozen=True)
 class SkillCheck:
     fact: str
     expected: str | bool | int | float
@@ -124,6 +152,7 @@ class SkillDefinition:
     timeout_seconds: float = 30.0
     max_observations: int = MAX_OBSERVATIONS
     schema_version: int = SCHEMA_VERSION
+    profile_pins: tuple[ProfilePin, ...] = ()
 
     def __post_init__(self):
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
@@ -132,7 +161,7 @@ class SkillDefinition:
             _text(getattr(self, name), name)
         if not isinstance(self.version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", self.version):
             raise ValueError("version must be major.minor.patch")
-        for name in ("compatible_profiles", "prerequisites", "expected_outcome", "references", "steps"):
+        for name in ("compatible_profiles", "prerequisites", "expected_outcome", "references", "steps", "profile_pins"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
         if not self.compatible_profiles:
             raise ValueError("explicit profile compatibility is required")
@@ -146,6 +175,13 @@ class SkillDefinition:
             raise ValueError("invalid workflow reference")
         if len(self.steps) > MAX_STEPS or any(not isinstance(s, SkillStep) for s in self.steps):
             raise ValueError("invalid or excessive steps")
+        if any(not isinstance(pin, ProfilePin) for pin in self.profile_pins):
+            raise ValueError('validated ProfilePin required')
+        pinned_ids = [pin.profile_id for pin in self.profile_pins]
+        if len(set(pinned_ids)) != len(pinned_ids) or set(pinned_ids) - set(self.compatible_profiles):
+            raise ValueError('duplicate or incompatible profile pins')
+        if self.steps and set(pinned_ids) != set(self.compatible_profiles):
+            raise ValueError('executable skills require exact profile version/hash pins')
         if (type(self.timeout_seconds) not in (int, float)
                 or not math.isfinite(self.timeout_seconds)
                 or not 0 < self.timeout_seconds <= MAX_TIMEOUT_SECONDS):
@@ -160,7 +196,7 @@ class SkillDefinition:
     def to_dict(self):
         return {"schema_version": self.schema_version, "skill_id": self.skill_id,
                 "version": self.version, "title": self.title, "game_id": self.game_id,
-                "compatible_profiles": list(self.compatible_profiles),
+                "compatible_profiles": list(self.compatible_profiles), "profile_pins": [p.to_dict() for p in self.profile_pins],
                 "prerequisites": [c.to_dict() for c in self.prerequisites],
                 "expected_outcome": [c.to_dict() for c in self.expected_outcome],
                 "references": [r.to_dict() for r in self.references],
@@ -172,11 +208,12 @@ class SkillDefinition:
     def from_dict(cls, data):
         _keys(data, {"schema_version", "skill_id", "version", "title", "game_id",
                     "compatible_profiles", "prerequisites", "expected_outcome",
-                    "references", "steps", "timeout_seconds", "max_observations"})
+                    "references", "steps", "timeout_seconds", "max_observations", "profile_pins"})
         copied = json.loads(_json(data))
         if "schema_version" not in copied:
             raise ValueError("schema_version is required")
         copied["compatible_profiles"] = tuple(copied["compatible_profiles"])
+        copied["profile_pins"] = tuple(ProfilePin.from_dict(pin) for pin in copied.get("profile_pins", []))
         for name in ("prerequisites", "expected_outcome"):
             copied[name] = tuple(SkillCheck.from_dict(c) for c in copied[name])
         refs = []
@@ -224,11 +261,11 @@ class SkillCatalog:
             ("godsarena.open-clients", "Open requested GodsArena clients", ("godsarena-client-lifecycle",),
              (SkillCheck("requested_clients_identified", True, "Fresh identities prevent duplicate launches"),),
              (SkillCheck("requested_huds_verified", True, "Requested character HUDs and server verified"),),
-             (WorkflowReference("skill://codex-home-skills/C:/Users/CHUBZ SERVER/.codex/skills/godsarena-open-clients/SKILL.md", "Existing owner launcher/login workflow"),)),
+             (WorkflowReference("installed-skill:godsarena-open-clients", "Existing owner launcher/login workflow"),)),
             ("godsarena.close-clients", "Normally close requested GodsArena clients", ("godsarena-client-lifecycle",),
              (SkillCheck("requested_clients_identified", True, "Fresh exact requested process/window identities"),),
              (SkillCheck("requested_processes_exited", True, "Original requested processes and windows absent"),),
-             (WorkflowReference("skill://codex-home-skills/C:/Users/CHUBZ SERVER/.codex/skills/godsarena-close-clients/SKILL.md", "Existing owner normal close-and-verify workflow"),)),
+             (WorkflowReference("installed-skill:godsarena-close-clients", "Existing owner normal close-and-verify workflow"),)),
         ]
         return cls(SkillDefinition(skill_id, "1.0.0", title, "godsarena", profiles,
                                    (ready,) + prerequisites, outcomes, references)
@@ -244,12 +281,19 @@ class SkillObservation:
     observation_id: str
     frame_id: int
     facts_json: str
+    captured_at: float
+    profile_version: str = ""
+    profile_hash: str = ""
 
     def __post_init__(self):
         for name in ("client", "game_id", "profile_id", "identity", "observation_id"):
             _text(getattr(self, name), name)
         if type(self.frame_id) is not int or self.frame_id < 0:
             raise ValueError("frame_id must be a nonnegative integer")
+        if self.profile_version or self.profile_hash:
+            ProfilePin(self.profile_id, self.profile_version, self.profile_hash)
+        if type(self.captured_at) not in (int, float) or not math.isfinite(self.captured_at) or self.captured_at < 0:
+            raise ValueError('captured_at must be the finite original monotonic capture timestamp')
         facts = json.loads(self.facts_json)
         if not isinstance(facts, dict):
             raise ValueError("observation facts must be an object")
@@ -399,7 +443,7 @@ class SkillRunner:
         self._observe, self._executor, self._clock = observe, executor, clock
 
     def run(self, definition: SkillDefinition, *, client: str, game_id: str,
-            profile_id: str, owner_authorized: bool = False, cancel=None):
+            profile_id: str, profile_version: str = "", profile_hash: str = "", owner_authorized: bool = False, cancel=None):
         """Explicit trusted-host call. A queued/uncertain action is never replayed."""
         result = {"skill_id": definition.skill_id, "version": definition.version,
                   "definition_hash": definition.definition_hash, "client": client,
@@ -416,6 +460,10 @@ class SkillRunner:
             return stop("blocked", "client/game/profile incompatible")
         if not definition.steps:
             return stop("reference_only", "consult source workflow; no executable steps registered")
+        pin = next((p for p in definition.profile_pins if p.profile_id == profile_id), None)
+        if pin is None or (profile_version, profile_hash) != (pin.version, pin.sha256):
+            return stop("blocked", "exact profile version/hash compatibility required")
+        result.update(profile_id=profile_id, profile_version=profile_version, profile_hash=profile_hash)
         budget = RunBudget(definition.timeout_seconds, cancel, self._clock)
         identity = None
 
@@ -430,6 +478,11 @@ class SkillRunner:
                 raise ValueError("trusted observation required")
             if (observation.client, observation.game_id, observation.profile_id) != (client, game_id, profile_id):
                 raise ValueError("observation client/game/profile changed")
+            if (observation.profile_version, observation.profile_hash) != (profile_version, profile_hash):
+                raise ValueError('same-ID profile version/hash changed')
+            age = time.monotonic() - observation.captured_at
+            if age < 0 or age > 1.0:
+                raise ValueError('observation capture timestamp is stale or future')
             if identity is not None and observation.identity != identity:
                 raise ValueError("target/capture/geometry identity changed")
             identity = observation.identity
@@ -475,3 +528,86 @@ class SkillRunner:
             return stop("timed_out", str(exc))
         except Exception as exc:
             return stop("blocked", f"callback or validation failed: {type(exc).__name__}")
+
+
+
+class GameLensSkillHost:
+    """Explicit local execution of user-defined skills on one supplied runtime.
+
+    perceive(jpeg_bytes, original_observation) is a pure facts callback. Binding
+    changes are read through an optional trusted profile_provider, never inferred
+    from user-supplied facts. Built-in catalog workflows remain reference-only.
+    """
+    def __init__(self, runtime, *, client: str, game_id: str, profile: ProfilePin,
+                 perceive: Callable, profile_provider: Callable[[], ProfilePin] | None = None):
+        _text(client, "client")
+        _text(game_id, "game_id")
+        if not isinstance(profile, ProfilePin) or not callable(perceive):
+            raise ValueError("reviewed profile pin and pure perception callback required")
+        if not callable(getattr(runtime, "encode_frame", None)) or not callable(
+                getattr(getattr(runtime, "observations", None), "resolve", None)):
+            raise ValueError("supplied GameLens full-frame runtime required")
+        if profile_provider is not None and not callable(profile_provider):
+            raise ValueError("profile_provider must be a trusted binding callback")
+        self._runtime = runtime
+        self.client, self.game_id, self.profile = client, game_id, profile
+        self._perceive = perceive
+        self._profile_provider = profile_provider or (lambda: profile)
+        self._runner = SkillRunner(self.observe, GuardedActionExecutor(runtime))
+
+    def _binding(self):
+        current = self._profile_provider()
+        if not isinstance(current, ProfilePin) or current != self.profile:
+            raise ValueError("loaded profile version/hash differs from reviewed host pin")
+        return current
+
+    def observe(self, budget: RunBudget) -> SkillObservation:
+        from gamelens.arbiter import Action, Rejection
+        from gamelens.server import Encoded, NO_FRAME
+
+        budget.check()
+        pin = self._binding()
+        while True:
+            budget.check()
+            encoded = self._runtime.encode_frame(retain=True, crop=None)
+            if encoded is not NO_FRAME:
+                break
+            budget.cancel.wait(min(0.01, budget.remaining))
+        budget.check()
+        if not isinstance(encoded, Encoded) or encoded.perception is not None:
+            raise ValueError("original full-frame encoding required")
+        original = self._runtime.observations.resolve(encoded.observation_id)
+        if original is None or original.frame_id != encoded.frame_id or original.crop_left or original.crop_top:
+            raise ValueError("original full-frame observation provenance unavailable")
+
+        def validate():
+            budget.check()
+            age = time.monotonic() - original.frame_captured_at
+            if age < 0 or age > 1.0:
+                raise ValueError("original capture timestamp is stale or future")
+            if self._runtime.observations.resolve(encoded.observation_id) is not original:
+                raise ValueError("original observation was retired")
+            if self._runtime.arbiter.evaluate(Action(original, [])) is not Rejection.OK:
+                raise ValueError("original observation target/capture/geometry/preemption changed")
+            if self._binding() != pin:
+                raise ValueError("profile changed during perception")
+
+        validate()
+        facts = self._perceive(encoded.jpeg, original)
+        validate()
+        identity = _json({"target_hwnd": original.target_hwnd,
+                          "capture_session": original.backend_session_id,
+                          "geometry_generation": original.geometry_generation,
+                          "frame_width": original.frame_width, "frame_height": original.frame_height,
+                          "preemption_counter": original.preemption_counter})
+        return SkillObservation.from_facts(
+            client=self.client, game_id=self.game_id, profile_id=pin.profile_id,
+            profile_version=pin.version, profile_hash=pin.sha256, identity=identity,
+            observation_id=encoded.observation_id, frame_id=original.frame_id,
+            captured_at=original.frame_captured_at, facts=facts)
+
+    def run(self, definition: SkillDefinition, *, owner_authorized: bool = False, cancel=None):
+        return self._runner.run(
+            definition, client=self.client, game_id=self.game_id,
+            profile_id=self.profile.profile_id, profile_version=self.profile.version,
+            profile_hash=self.profile.sha256, owner_authorized=owner_authorized, cancel=cancel)

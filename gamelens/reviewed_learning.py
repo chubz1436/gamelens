@@ -179,8 +179,7 @@ class ReviewedLearningStore:
         return r
 
     def _replace(self, key, record):
-        if len(record['history']) > 100:
-            raise LearningDenied('review history full')
+        record['history'] = record['history'][-100:]
         snapshot(record)
         records = dict(self._records)
         records[key] = record
@@ -203,6 +202,8 @@ class ReviewedLearningStore:
             v = r['review']
             if not v or v['decision'] != 'approve' or v['candidate_hash'] != candidate_hash or v['owner'] != owner:
                 raise LearningDenied('explicit approval by activating owner required')
+            if r['active']:
+                return r
             r['active'] = True
             r['history'].append(dict(event='activate', candidate_hash=candidate_hash, owner=owner))
             self._replace(proposal_id, r)

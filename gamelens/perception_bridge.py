@@ -44,6 +44,8 @@ class PerceptionViews:
             for step in steps:
                 if not isinstance(step, dict):
                     raise ValueError("sequence step must be an object")
-                if step.get("do") == "move" or (step.get("do") == "click" and ("x" in step or "y" in step)):
+                operation = str(step.get("do", "")).strip().lower()
+                step["do"] = operation
+                if operation == "move" or (operation == "click" and ("x" in step or "y" in step)):
                     step["x"], step["y"] = view.to_parent_image_xy(step["x"], step["y"])
         return result

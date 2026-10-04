@@ -8,8 +8,19 @@
 
 HTTP/MCP adapters must derive owner from an authenticated operator channel and must not expose review/activation to agent credentials. A supplied owner string alone is not authentication. Read-only agent listing is permissible. The module never arms a session or alters any existing supervisor policy.
 
-Optional path persistence uses fsync and atomic replace. Proposal count is bounded (default 100, max 1000), each payload/record is bounded to 256 KiB, and review history is limited to 100 entries. Full stores refuse additions rather than discard evidence. Persistence failure leaves memory unchanged. Use one store instance per durable path; cross-process shared writers are unsupported. Protect the durable file with filesystem access controls. Reload validates proposal hashes and resets approval/activation, retaining historical reviews; restarting cannot silently activate learned behavior.
+Optional path persistence uses fsync and atomic replace. Proposal count is bounded (default 100, max 1000), each payload/record is bounded to 256 KiB, and review history retains the latest 100 transitions. Full stores refuse additions rather than discard evidence. Persistence failure leaves memory unchanged. Use one store instance per durable path; cross-process shared writers are unsupported. Protect the durable file with filesystem access controls. Reload validates proposal hashes and resets approval/activation, retaining historical reviews; restarting cannot silently activate learned behavior.
 
 Tests: tests/test_reviewed_learning.py covers approval/hash/owner binding, rejection, immutable evidence, unsafe candidate fields, required evidence, capacity, reload/tamper detection, and persistence failure.
 
 Durable path hardening: destinations and all parent ancestors are rejected when symlinks or Windows reparse points. Temporary files use random names and exclusive creation (O_EXCL, plus O_NOFOLLOW where available), are fsynced, and are removed on failure. Existing predictable .tmp files are never opened. Storage must reside in a trusted directory without concurrent hostile directory-entry replacement; path checks do not provide cross-process isolation against ancestor swaps. Symlink tests explicitly skip where platform privileges prohibit creation; an exclusive collision test requires no links.
+
+The default GameLens runtime constructs an in-memory store. Durable storage is optional
+through the local library path argument; default HTTP proposals do not persist to disk.
+HTTP proposal/review/advisory activation and objective mutations run off the ASGI event
+loop with one outstanding evidence mutation per app. Contending requests receive429.
+Cancelled requests retain admission until the actual worker finishes. /stop remains
+independent and responsive during a stalled store operation.
+
+Repeated activation by the already-approved owner for the same active hash is idempotent and does not append history. A new review, including rejection, retains the latest 100 transitions so exhausted history cannot block deactivation. Immutable proposal and evidence snapshots are never truncated. Persistence failures still leave memory unchanged and must be surfaced to the operator.
+Learning and metrics evidence reads/checkpoints share bounded asynchronous admission;
+readers cannot fill the control-worker pool while a durable writer holds its lock.

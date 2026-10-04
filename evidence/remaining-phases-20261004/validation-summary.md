@@ -19,3 +19,17 @@ patterns inspected:2existing dummy credential URL fixtures in test_multi_client.
 credential found; no recording, session handoff, local configuration or unrelated checkout work.
 Owner authorized dedicated feature push and draft PR; no merge/deployment. All workers requested
 explicit gpt-6.1-sol; observed identity unavailable (rollout_not_found); no fallback selected.
+
+## Parent direct-review remediation checkpoint
+Extended regressions124passed/4symlink-skipped/0failures. Added exact skill profile-version/SHA256
+pins at admission and every outcome; required original capture timestamps; trusted local
+GameLensSkillHost binds actual encode/registry/arbiter/guarded sequence. Built-in catalog remains
+three inert references; portable installed skill names replace owner absolute skill paths.
+Async learning/objective mutations plus evidence reads/checkpoints use bounded one-worker
+admission, including cancelled requests retaining their slot; stalled durable write plus64readers
+does not stall /stop. Default learning memory-only, optional library durability explicit.
+Canonical mixed-case/whitespace crop sequence coordinates now map correctly; finalized video
+links on orderly shutdown before finish/checkpoint with bounded dedupe; repeated activation
+idempotent and bounded-history rejection remains possible. Idle metrics rotate on resumed
+operations. Legacy partial-action/shutdown diagnostic compatibility corrected. Aggregate/Phase1
+validation continues; no live gameplay/input/deployment.

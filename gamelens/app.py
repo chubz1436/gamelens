@@ -329,6 +329,9 @@ class GameLens:
         self.port = port
         self.tokens = Tokens()
         self.log = ActionLog()
+        self._video_link_lock = threading.Lock()
+        self._linked_clips = OrderedDict()
+        self._metrics_run_lock = threading.RLock()
         self.run_metrics = RunMetrics()
         self.run_id = self.run_metrics.begin_run()
         self.run_store = LocalRunStore(base_directory=metrics_directory, enabled=metrics_directory is not None)
@@ -378,7 +381,10 @@ class GameLens:
         recorder = getattr(self, "recorder", None)
         if recorder is not None:
             try:
-                recorder.stop()
+                clip = recorder.stop()
+                link = getattr(self, "link_recording", None)
+                if callable(link):
+                    link(clip)
             except ValueError:
                 log.error("Recorder still finishing during shutdown")
         self._stop.set()
@@ -389,8 +395,12 @@ class GameLens:
         self.executor.shutdown()
         self.capture.stop()
         self.safety.shutdown()
-        self._metrics_call("finish_run", status="completed")
-        self.checkpoint_metrics()
+        finish = getattr(self, "_metrics_call", None)
+        if callable(finish):
+            finish("finish_run", status="completed")
+        checkpoint = getattr(self, "checkpoint_metrics", None)
+        if callable(checkpoint):
+            checkpoint()
 
     def _poll(self) -> None:
         """Track geometry and frame statistics.
@@ -544,20 +554,57 @@ class GameLens:
         if metrics is None:
             return None
         try:
-            return getattr(metrics, method)(self.run_id, *args, **kwargs)
+            with getattr(self, "_metrics_run_lock", metrics._lock):
+                if not metrics.has_run(self.run_id):
+                    self.run_id = metrics.begin_run()
+                return getattr(metrics, method)(self.run_id, *args, **kwargs)
         except Exception:
             log.debug("passive run metrics unavailable", exc_info=True)
             return None
+
+    def metrics_snapshot(self):
+        return self._metrics_call("snapshot")
 
     def checkpoint_metrics(self):
         store = getattr(self, "run_store", None)
         if store is None:
             return {"saved": False, "reason": "disabled"}
         try:
-            return store.save(self.run_metrics.snapshot(self.run_id))
+            return store.save(self.metrics_snapshot())
         except Exception:
             log.warning("run checkpoint unavailable")
             return {"saved": False, "reason": "storage unavailable"}
+
+    def link_recording(self, snapshot):
+        """Link a successfully finalized clip once; never starts recording/input."""
+        if (not isinstance(snapshot, dict) or snapshot.get("active") is not False
+                or snapshot.get("error") or not snapshot.get("file")
+                or not snapshot.get("frames")):
+            return False
+        metrics = getattr(self, "run_metrics", None)
+        if metrics is None:
+            return False
+        from pathlib import PureWindowsPath
+        try:
+            with getattr(self, "_video_link_lock", metrics._lock):
+                self.metrics_snapshot()
+                name = PureWindowsPath(snapshot["file"]).name
+                key = (self.run_id, name)
+                links = getattr(self, "_linked_clips", None)
+                if links is None:
+                    links = self._linked_clips = OrderedDict()
+                if key in links:
+                    return False
+                event = self._metrics_call("link_video", name, name, end_seconds=snapshot.get("seconds"))
+                if event is None:
+                    return False
+                links[key] = True
+                while len(links) > 128:
+                    links.popitem(last=False)
+                return True
+        except Exception:
+            log.debug("passive clip link unavailable", exc_info=True)
+            return False
 
     def dispatch_with_metrics(self, fn, context, **kwargs):
         self._metrics_context.value = context
@@ -871,7 +918,7 @@ class GameLens:
         context = getattr(getattr(self, "_metrics_context", None), "value", {})
         bound_observation_id = "action-source-" + str(action.action_id)
         metrics_observation = context.get("observation_id") or bound_observation_id
-        self._metrics_call("record_observation", bound_observation_id, action.observation, source="action", freshness_limit=getattr(self.arbiter, "_observation_deadline", 1.0))
+        self._metrics_call("record_observation", bound_observation_id, getattr(action, "observation", None), source="action", freshness_limit=getattr(self.arbiter, "_observation_deadline", 1.0))
         self._metrics_call("record_action", action.action_id, observation_id=metrics_observation,
                            kind=context.get("kind", "guarded"), attempt=context.get("attempt", 1),
                            retry_of=context.get("retry_of"), log_id=entry_id, bound_observation_id=bound_observation_id)

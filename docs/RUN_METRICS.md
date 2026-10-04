@@ -41,3 +41,6 @@ An optional `RunMetrics(sink=store)` API is available for offline callers; it se
 `tests/test_run_metrics.py` covers provenance copies, freshness, URL-safe IDs, monotonic latency, pending/terminal separation, explicit objective evidence, retries, count/event/age bounds, concurrent sequence allocation, video references and sink failure isolation. `tests/test_run_store.py` covers default-off behavior, atomic round trips, schema/media exclusion, file/event/byte/age quotas, preservation of foreign data, failure cleanup, existing snapshot preservation, link rejection when supported and concurrent bounded saves.
 
 These tests use fake observations and temporary directories. They do not send live game input, change session authority or open media.
+
+An idle runtime run that expires rotates to a new run ID on the next evidence operation.
+Original timestamps are not refreshed; bounded retention still applies to expired runs.

@@ -6,10 +6,11 @@ from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
+from tests.test_rebind import lens  # fixture: no capture worker or real input
 
 from gamelens.game_skills import (
     GuardedActionExecutor, RunBudget, SkillCatalog, SkillCheck, SkillDefinition,
-    SkillObservation, SkillRunner, SkillStep, WorkflowReference,
+    SkillObservation, SkillRunner, SkillStep, WorkflowReference, ProfilePin, GameLensSkillHost, profile_content_hash,
 )
 
 
@@ -23,11 +24,13 @@ def skill_definition():
         (WorkflowReference('tests/test_game_skills.py', 'Synthetic fixture only'),),
         (SkillStep('one decision', json.dumps([{'do': 'tap', 'key': 'w', 'ms': 20}]),
                    (ready,), (changed,)),), max_observations=4,
+        profile_pins=(ProfilePin('fixture-profile', '1.0.0', 'a' * 64),),
     )
 
 
 def observation(frame=1, **changes):
-    data = dict(client='fixture-client', game_id='fixture-game',
+    data = dict(client='fixture-client', game_id='fixture-game', captured_at=time.monotonic(),
+                profile_version='1.0.0', profile_hash='a' * 64,
                 profile_id='fixture-profile', identity='target/capture/geometry-A',
                 observation_id=f'obs-{frame}', frame_id=frame,
                 facts={'ready': True, 'receipt': 'complete' if frame > 1 else 'pending'})
@@ -64,12 +67,14 @@ def runner(frames, delegate=None, clock=None):
     observations = iter(frames)
     gl = delegate or GameLensFixture()
     options = {'clock': clock} if clock else {}
-    return SkillRunner(lambda budget: next(observations), GuardedActionExecutor(gl), **options), gl
+    # Synthetic read publishes its fixture timestamp at callback time.
+    return SkillRunner(lambda budget: replace(next(observations), captured_at=time.monotonic()), GuardedActionExecutor(gl), **options), gl
 
 
 def run(subject, definition, **options):
     defaults = dict(client='fixture-client', game_id='fixture-game',
-                    profile_id='fixture-profile', owner_authorized=True)
+                    profile_id='fixture-profile', profile_version='1.0.0',
+                    profile_hash='a' * 64, owner_authorized=True)
     defaults.update(options)
     return subject.run(definition, **defaults)
 
@@ -409,3 +414,193 @@ def test_next_decision_only_after_verified_outcome_and_callback_quiescence(skill
     assert result['completed_steps'] == 2
     assert [call['observation_id'] for call in gl.calls] == ['obs-1', 'obs-3']
     assert gl.kills == []
+
+
+
+
+@pytest.mark.parametrize('options', [
+    {'profile_version': '2.0.0'}, {'profile_hash': 'b' * 64},
+    {'profile_version': ''}, {'profile_hash': ''},
+])
+def test_profile_pins_reject_same_id_changed_binding_before_observation(skill_definition, options):
+    subject, gl = runner([])
+    result = run(subject, skill_definition, **options)
+    assert result['status'] == 'blocked'
+    assert not gl.calls
+
+
+@pytest.mark.parametrize('changes', [
+    {'profile_version': '2.0.0'}, {'profile_hash': 'b' * 64},
+])
+def test_profile_pins_reject_same_id_changed_outcome_binding(skill_definition, changes):
+    subject, gl = runner([observation(), observation(3, **changes)])
+    result = run(subject, skill_definition)
+    assert result['status'] == 'blocked'
+    assert result['completed_steps'] == 0
+    assert len(gl.calls) == 1
+
+
+def test_unpinned_legacy_executable_definition_is_denied(skill_definition):
+    raw = skill_definition.to_dict()
+    raw.pop('profile_pins')
+    with pytest.raises(ValueError, match='exact profile'):
+        SkillDefinition.from_dict(raw)
+    with pytest.raises(ValueError, match='exact profile'):
+        replace(skill_definition, profile_pins=())
+    raw['steps'] = []
+    assert not SkillDefinition.from_dict(raw).profile_pins  # inert metadata only
+
+
+def test_profile_pin_hash_changes_definition_and_default_references_are_portable(skill_definition):
+    pin = ProfilePin('fixture-profile', '1.0.0', 'b' * 64)
+    assert replace(skill_definition, profile_pins=(pin,)).definition_hash != skill_definition.definition_hash
+    assert profile_content_hash({'a': 1, 'b': 2}) == profile_content_hash({'b': 2, 'a': 1})
+    references = [r['source'] for e in SkillCatalog.reference_catalog().list_skills() for r in e['references']]
+    assert 'installed-skill:godsarena-open-clients' in references
+    assert 'installed-skill:godsarena-close-clients' in references
+    assert all('C:/Users/' not in ref and 'CHUBZ SERVER' not in ref for ref in references)
+
+
+def test_original_capture_timestamp_is_required():
+    with pytest.raises(TypeError):
+        SkillObservation.from_facts(client='fixture-client', game_id='fixture-game',
+            profile_id='fixture-profile', identity='source', observation_id='original',
+            frame_id=1, facts={'ready': True})
+
+
+@pytest.mark.parametrize('age', [2.0, -1.0])
+def test_stale_or_future_outcome_facts_cannot_be_restamped(skill_definition, age):
+    gl = GameLensFixture()
+    observations = iter([observation(), observation(3, captured_at=time.monotonic() - age)])
+    subject = SkillRunner(lambda budget: next(observations), GuardedActionExecutor(gl))
+    result = run(subject, skill_definition)
+    assert result['status'] == 'blocked'
+    assert result['completed_steps'] == 0
+    assert len(gl.calls) == 1
+
+
+@pytest.fixture
+def skill_host_runtime(lens):
+    from gamelens.app import GameLens
+    from tests.test_rebind import ArrFrame
+    lens.calls = []
+    lens.kills = []
+    lens.safety = SimpleNamespace(kill=lens.kills.append)
+    lens.sequence_capacity = lambda: 10
+    lens.capture.frames.latest_id = lambda: lens.capture.frames.frame.frame_id
+    lens.arbiter._observation_deadline = 1.0  # synthetic fixture uses production defaults
+    lens.arbiter._action_ttl = 0.8
+    fake_executor = lens.arbiter._executor
+    def accept_synthetic(seq):
+        fake_executor.submitted.append(seq)
+        seq.on_outcome(SimpleNamespace(status='sent', detail='', completed_steps=len(seq.steps),
+            injected_steps=1, last_completed_step=len(seq.steps)-1, partial=False))
+        return True
+    fake_executor.submit = accept_synthetic
+    def guarded_sequence(**call):
+        lens.calls.append(call)
+        result = GameLens.submit_sequence(lens, **call)  # real original guard path
+        old = lens.capture.frames.frame
+        lens.capture.frames.frame = ArrFrame(old.frame_id + 1, old.array.copy(), old.session_id)
+        return result
+    lens.submit_sequence = guarded_sequence
+    return lens
+
+
+def make_host(runtime, perceive=None, profile_provider=None):
+    if perceive is None:
+        perceive = lambda jpeg, original: {'ready': True, 'receipt': 'complete' if original.frame_id > 1 else 'pending'}
+    return GameLensSkillHost(runtime, client='fixture-client', game_id='fixture-game',
+        profile=ProfilePin('fixture-profile', '1.0.0', 'a' * 64), perceive=perceive,
+        profile_provider=profile_provider)
+
+
+def test_trusted_host_observation_preserves_real_full_frame_provenance(skill_host_runtime):
+    runtime = skill_host_runtime
+    observed = []
+    def perceive(jpeg, original):
+        assert jpeg.startswith(b'\xff\xd8')
+        observed.append(original)
+        return {'ready': True}
+    host = make_host(runtime, perceive)
+    result = host.observe(RunBudget(1))
+    original = runtime.observations.resolve(result.observation_id)
+    assert original is observed[0]
+    assert result.frame_id == original.frame_id
+    assert result.captured_at == original.frame_captured_at
+    identity = json.loads(result.identity)
+    assert identity['target_hwnd'] == runtime.capture.binding.hwnd
+    assert identity['capture_session'] == runtime.capture.backend.session_id
+    assert identity['geometry_generation'] == runtime.geometry.generation
+    assert result.profile_hash == 'a' * 64 and result.profile_version == '1.0.0'
+    assert not runtime.calls
+
+
+def test_trusted_host_executes_user_defined_skill_via_real_guarded_runtime(skill_host_runtime, skill_definition):
+    runtime = skill_host_runtime
+    host = make_host(runtime)
+    assert host.run(skill_definition)['status'] == 'blocked'
+    assert runtime.calls == []
+    result = host.run(skill_definition, owner_authorized=True)
+    assert result['status'] == 'succeeded'
+    assert result['completed_steps'] == 1
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]['observation_id'] == result['observation_ids'][0]
+    assert runtime.calls[0]['rebind'] is False
+    assert len(runtime.arbiter._executor.submitted) == 1
+    assert not runtime.kills
+
+
+def test_trusted_host_same_id_changed_loaded_profile_is_denied(skill_host_runtime, skill_definition):
+    host = make_host(skill_host_runtime, profile_provider=lambda: ProfilePin('fixture-profile', '2.0.0', 'b' * 64))
+    assert host.run(skill_definition, owner_authorized=True)['status'] == 'blocked'
+    assert skill_host_runtime.calls == []
+
+
+@pytest.mark.parametrize('change', ['profile', 'geometry', 'capture', 'future', 'stale'])
+def test_trusted_host_rechecks_binding_after_perception(skill_host_runtime, skill_definition, change):
+    runtime = skill_host_runtime
+    active = [ProfilePin('fixture-profile', '1.0.0', 'a' * 64)]
+    if change in {'future', 'stale'}:
+        runtime.capture.frames.frame.captured_at = time.monotonic() + (1 if change == 'future' else -2)
+    def perceive(jpeg, original):
+        if change == 'profile':
+            active[0] = ProfilePin('fixture-profile', '1.0.0', 'b' * 64)
+        elif change == 'geometry':
+            runtime.geometry.move()
+        elif change == 'capture':
+            runtime.capture.backend.retired = True
+        return {'ready': True}
+    host = make_host(runtime, perceive, profile_provider=lambda: active[0])
+    assert host.run(skill_definition, owner_authorized=True)['status'] == 'blocked'
+    assert runtime.calls == []
+
+
+def test_trusted_host_rejects_same_id_profile_change_after_guarded_action(skill_host_runtime, skill_definition):
+    runtime = skill_host_runtime
+    active = [ProfilePin('fixture-profile', '1.0.0', 'a' * 64)]
+    original_submit = runtime.submit_sequence
+    def changed_profile_after_action(**call):
+        receipt = original_submit(**call)
+        active[0] = ProfilePin('fixture-profile', '1.0.0', 'b' * 64)
+        return receipt
+    runtime.submit_sequence = changed_profile_after_action
+    host = make_host(runtime, profile_provider=lambda: active[0])
+    result = host.run(skill_definition, owner_authorized=True)
+    assert result['status'] == 'blocked'
+    assert result['completed_steps'] == 0
+    assert len(runtime.calls) == 1
+
+
+def test_trusted_host_missing_frame_observation_honors_cancel(skill_host_runtime):
+    from gamelens.game_skills import SkillCancelled
+    from gamelens.server import NO_FRAME
+    cancel = threading.Event()
+    def no_frame(**options):
+        cancel.set()
+        return NO_FRAME
+    skill_host_runtime.encode_frame = no_frame
+    host = make_host(skill_host_runtime)
+    with pytest.raises(SkillCancelled):
+        host.observe(RunBudget(1, cancel))
+    assert skill_host_runtime.calls == []

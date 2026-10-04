@@ -408,10 +408,9 @@ def create_app(runtime) -> FastAPI:
             raise HTTPException(503, "Recording is unavailable in this runtime")
         try:
             result = recorder.stop()
-            record = getattr(runtime, "_metrics_call", None)
-            if record is not None and result.get("file"):
-                name = Path(result["file"]).name
-                record("link_video", name, name, end_seconds=result.get("seconds"))
+            link = getattr(runtime, "link_recording", None)
+            if callable(link):
+                link(result)
             return JSONResponse(result)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -460,19 +459,35 @@ def create_app(runtime) -> FastAPI:
         runtime.log.add(f"STOPPED by {role}", "denied")
         return JSONResponse(runtime.state())
 
+    learning_work = {"active": 0}
+
+    async def bounded_mutation(fn, *args, **kwargs):
+        # Admission and completion callbacks run only on this event loop.
+        # A cancelled HTTP request retains its slot until the actual worker ends.
+        if learning_work["active"] >= 1:
+            raise HTTPException(429, "an evidence mutation is already in progress")
+        learning_work["active"] += 1
+        task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        def finished(done):
+            learning_work["active"] -= 1
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
     @app.get("/metrics")
-    def metrics(role: str = Depends(any_role)):
+    async def metrics(role: str = Depends(any_role)):
         metric = getattr(runtime, "run_metrics", None)
         if metric is None:
             raise HTTPException(503, "run metrics unavailable")
-        return metric.snapshot(runtime.run_id)
+        return await bounded_mutation(runtime.metrics_snapshot)
 
     @app.post("/metrics/checkpoint")
-    def metrics_checkpoint(role: str = Depends(operator_only)):
+    async def metrics_checkpoint(role: str = Depends(operator_only)):
         checkpoint = getattr(runtime, "checkpoint_metrics", None)
         if checkpoint is None:
             raise HTTPException(503, "run metrics unavailable")
-        return checkpoint()
+        return await bounded_mutation(checkpoint)
 
     @app.post("/metrics/objective")
     async def metrics_objective(request: Request, role: str = Depends(operator_only)):
@@ -480,7 +495,10 @@ def create_app(runtime) -> FastAPI:
         if set(body) != {"objective_id", "success", "evidence"}:
             raise HTTPException(400, "objective requires objective_id, success and evidence references")
         try:
-            return runtime.run_metrics.record_objective(runtime.run_id, **body)
+            def record():
+                runtime.metrics_snapshot()
+                return runtime.run_metrics.record_objective(runtime.run_id, **body)
+            return await bounded_mutation(record)
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from None
 
@@ -490,11 +508,12 @@ def create_app(runtime) -> FastAPI:
         return {"skills": SkillCatalog.reference_catalog().list_skills(), "execution": "explicit-local-guarded-only"}
 
     @app.get("/learning")
-    def learning(role: str = Depends(any_role)):
+    async def learning(role: str = Depends(any_role)):
         store = getattr(runtime, "reviewed_learning", None)
         if store is None:
             raise HTTPException(503, "reviewed learning unavailable")
-        return {"proposals": store.list_proposals(), "runtime_activation": False}
+        proposals = await bounded_mutation(store.list_proposals)
+        return {"proposals": proposals, "runtime_activation": False}
 
     async def bounded_learning_body(request):
         chunks, size = [], 0
@@ -519,7 +538,7 @@ def create_app(runtime) -> FastAPI:
         if set(body) != expected:
             raise HTTPException(400, "proposal requires skill_id, failure_evidence, candidate and test_evidence")
         try:
-            return runtime.reviewed_learning.propose(**body)
+            return await bounded_mutation(runtime.reviewed_learning.propose, **body)
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from None
 
@@ -529,7 +548,7 @@ def create_app(runtime) -> FastAPI:
         if set(body) - {"candidate_hash", "decision", "notes"} or not {"candidate_hash", "decision"} <= set(body):
             raise HTTPException(400, "review requires exact candidate_hash and decision")
         try:
-            return runtime.reviewed_learning.review(proposal_id, owner="session-operator", **body)
+            return await bounded_mutation(runtime.reviewed_learning.review, proposal_id, owner="session-operator", **body)
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from None
 
@@ -539,7 +558,7 @@ def create_app(runtime) -> FastAPI:
         if set(body) != {"candidate_hash"}:
             raise HTTPException(400, "activation requires exact candidate_hash")
         try:
-            result = runtime.reviewed_learning.activate(proposal_id, owner="session-operator", **body)
+            result = await bounded_mutation(runtime.reviewed_learning.activate, proposal_id, owner="session-operator", **body)
             return {"proposal": result, "runtime_activation": False}
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc)) from None

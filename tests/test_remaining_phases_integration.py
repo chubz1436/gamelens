@@ -218,3 +218,136 @@ def test_mcp_evidence_never_dispatches_or_changes_observation(tool,path):
     result,error=getattr(gl,tool)({})
     assert not error and requests==[(path,None)] and gl.shown=='original-obs'
     with pytest.raises(ToolError):getattr(gl,tool)({'owner':'fake'})
+
+
+def test_expired_runtime_run_rotates_before_resumed_evidence(runtime):
+    import time
+    clock=[time.monotonic()]
+    runtime.run_metrics=RunMetrics(max_age_seconds=1,monotonic=lambda:clock[0])
+    runtime.run_id=runtime.run_metrics.begin_run()
+    old=runtime.run_id
+    clock[0]+=2
+    assert client(runtime).get('/metrics').json()['run_id']!=old
+    resumed=runtime.run_id
+    runtime.encode_frame()
+    snapshot=runtime.metrics_snapshot()
+    assert snapshot['run_id']==resumed and snapshot['events'][-1]['kind']=='observation'
+    assert not runtime.run_metrics.has_run(old)
+
+
+def test_stalled_durable_learning_cannot_block_stop_or_unbound_admission(runtime,tmp_path):
+    import asyncio
+    import httpx
+    import time
+    store=ReviewedLearningStore(tmp_path/'learning.json')
+    original=store._commit
+    entered,release=threading.Event(),threading.Event()
+    def stalled(records):
+        entered.set()
+        if not release.wait(2):raise RuntimeError('fixture deadline')
+        original(records)
+    store._commit=stalled
+    runtime.reviewed_learning=store
+    killed=[]
+    runtime.safety=SimpleNamespace(kill=lambda reason:killed.append(reason))
+    runtime.state=lambda:{'safety':{'killed':bool(killed)}}
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)),
+            base_url='http://127.0.0.1:8777',headers={'X-GameLens-Token':runtime.tokens.operator}) as c:
+            start=time.monotonic()
+            mutation=asyncio.create_task(c.post('/learning/proposals',json=proposal()))
+            async def stop_probe():
+                await asyncio.sleep(.02)
+                answer=await c.post('/stop')
+                return answer,time.monotonic()-start
+            reads=[asyncio.create_task(c.get("/learning")) for _ in range(64)]
+            stop_task=asyncio.create_task(stop_probe())
+            try:
+                answer,elapsed=await asyncio.wait_for(stop_task,timeout=.75)
+                assert entered.is_set() and not mutation.done()
+                assert answer.status_code==200 and elapsed<.75 and killed
+                assert all(reply.status_code==429 for reply in await asyncio.gather(*reads))
+                assert (await c.post('/learning/proposals',json=proposal())).status_code==429
+                assert (await c.post('/metrics/objective',json={'objective_id':'o','success':True,'evidence':[]})).status_code==429
+            finally:
+                release.set()
+            assert (await mutation).status_code==200
+    asyncio.run(exercise())
+
+
+def test_cancelled_evidence_request_retains_worker_admission_until_completion(runtime):
+    import asyncio
+    import httpx
+    entered,release=threading.Event(),threading.Event()
+    original=runtime.reviewed_learning.propose
+    def stalled(**kw):
+        entered.set()
+        if not release.wait(2):raise RuntimeError('fixture deadline')
+        return original(**kw)
+    runtime.reviewed_learning.propose=stalled
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)),
+            base_url='http://127.0.0.1:8777',headers={'X-GameLens-Token':runtime.tokens.agent}) as c:
+            task=asyncio.create_task(c.post('/learning/proposals',json=proposal()))
+            try:
+                for _ in range(100):
+                    if entered.is_set():break
+                    await asyncio.sleep(.005)
+                assert entered.is_set()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):await task
+                assert (await c.post('/learning/proposals',json=proposal())).status_code==429
+            finally:release.set()
+            for _ in range(100):
+                if runtime.reviewed_learning.list_proposals():break
+                await asyncio.sleep(.005)
+            assert runtime.reviewed_learning.list_proposals()
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('operation',[' MOVE ','Move',' CLICK ','Click'])
+def test_crop_sequence_canonical_operations_map_nonzero_origin(runtime,operation):
+    from gamelens.arbiter import PointAt
+    c=client(runtime)
+    image=c.get('/frame.jpg?crop=dialog')
+    view=json.loads(image.headers['X-GameLens-Perception'])
+    left,top,right,bottom=view['rect']
+    assert left>0 and top>0
+    px=(left+3*(right-left)/view['image_width'])*view['parent']['scale']
+    py=(top+4*(bottom-top)/view['image_height'])*view['parent']['scale']
+    response=c.post('/act',json={'kind':'sequence','observation_id':image.headers['X-GameLens-Observation'],
+                                'steps':[{'do':operation,'x':3,'y':4}]})
+    assert response.status_code==200
+    points=[step for step in runtime.calls[-1]['steps'] if isinstance(step,PointAt)]
+    assert len(points)==1 and points[0].x==pytest.approx(px) and points[0].y==pytest.approx(py)
+
+
+def test_orderly_shutdown_final_clip_is_deduplicated_and_persisted(runtime,tmp_path):
+    runtime.run_store=LocalRunStore(tmp_path,enabled=True)
+    clip={'active':False,'error':'','file':str(tmp_path/'fixture.mp4'),'frames':60,'seconds':2.0}
+    events=[]
+    runtime.recorder=SimpleNamespace(stop=lambda:(events.append('recorder') or dict(clip)))
+    runtime.safety=SimpleNamespace(kill=lambda reason:events.append('kill'),shutdown=lambda:None)
+    runtime._stop=SimpleNamespace(set=lambda:None)
+    runtime._poller=None;runtime.agent=None
+    runtime.executor=SimpleNamespace(shutdown=lambda:None)
+    runtime.capture.stop=lambda:None
+    assert runtime.link_recording(clip) is True
+    runtime.stop()
+    assert events[:2]==['kill','recorder']
+    saved=runtime.run_store.snapshots()
+    assert len(saved)==1 and saved[0]['status']=='completed'
+    videos=[e for e in saved[0]['events'] if e['kind']=='video']
+    assert len(videos)==1 and videos[0]['reference']=='fixture.mp4' and videos[0]['end_seconds']==2.0
+
+
+def test_shutdown_links_new_clip_before_finishing_run(runtime,tmp_path):
+    runtime.run_store=LocalRunStore(tmp_path,enabled=True)
+    clip={'active':False,'error':'','file':str(tmp_path/'new.mp4'),'frames':30,'seconds':1.0}
+    runtime.recorder=SimpleNamespace(stop=lambda:clip)
+    runtime.safety=SimpleNamespace(kill=lambda reason:None,shutdown=lambda:None)
+    runtime._stop=SimpleNamespace(set=lambda:None);runtime._poller=None;runtime.agent=None
+    runtime.executor=SimpleNamespace(shutdown=lambda:None);runtime.capture.stop=lambda:None
+    runtime.stop()
+    kinds=[e['kind'] for e in runtime.run_store.snapshots()[0]['events']]
+    assert kinds.index('video')<kinds.index('terminal')
