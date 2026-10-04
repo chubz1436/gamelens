@@ -506,3 +506,8 @@ See [the setup checker contract and limits](docs/SETUP_CHECKER.md).
 
 The isolated `tests_setup/` tests are **authored, NOT RUN** for this implementation.
 No installation, workflow dispatch, live-game test or later phase is included.
+
+## Remaining phases candidate
+
+See [metrics, cropped perception, reusable skills and reviewed learning](docs/REMAINING_PHASES.md)
+for the new opt-in interfaces and safety boundaries. No installation or gameplay starts from these additions.

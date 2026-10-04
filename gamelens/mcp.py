@@ -46,7 +46,7 @@ from gamelens.transport import local_opener, validate_url
 log = logging.getLogger("gamelens.mcp")
 
 SERVER_NAME = "gamelens"
-SERVER_VERSION = "0.49.0"
+SERVER_VERSION = "0.50.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 HTTP_TIMEOUT = 10.0
 
@@ -140,7 +140,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"quality": {"type": "integer", "minimum": 1, "maximum": 100,
-                                       "default": 50}},
+                                       "default": 50},
+                           "crop": {"type": "string", "enum": ["full", "hud", "minimap", "dialog"],
+                                    "description": "Optional bounded crop; coordinates remain pixels of this shown image. Full fallback retains provenance."}},
         },
     },
     {
@@ -173,6 +175,18 @@ TOOLS = [
         },
     },
 ]
+
+TOOLS.extend([
+    {"name": "gamelens_" + name,
+     "description": description,
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+     "annotations": {"readOnlyHint": True, "openWorldHint": False}}
+    for name, description in (
+        ("metrics", "Read bounded run evidence and correlated action outcomes. Sent input does not establish objective success."),
+        ("skills", "List versioned reusable guarded skills and existing workflow references. Listing never runs a skill."),
+        ("learning", "Read failure-derived improvement proposals. Agent credentials cannot review or activate learned changes."),
+    )
+])
 
 
 class ToolError(Exception):
@@ -232,9 +246,11 @@ class GameLensClient:
 
     # --- pieces ---------------------------------------------------------------
 
-    def frame(self, quality: int, after: int | None = None, frames: int = 3):
+    def frame(self, quality: int, after: int | None = None, frames: int = 3, *, crop=None):
         """``(content_items, detail_or_None)``; becomes the shown image on success."""
         query = {"quality": quality}
+        if crop is not None:
+            query["crop"] = crop
         if after is not None:
             query.update(after=after, frames=frames, wait_ms=1500)
         status, body, headers = self.request("/frame.jpg?" + urllib.parse.urlencode(query))
@@ -244,8 +260,24 @@ class GameLensClient:
         obs = headers.get("X-GameLens-Observation")
         if not obs:
             return [], "frame came without an observation id"
+        perception = headers.get("X-GameLens-Perception")
+        view = None
+        if perception is not None:
+            try:
+                view = json.loads(perception)
+                if not isinstance(view, dict):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                self.shown = None
+                return [], "frame crop mapping was unreadable; request a full frame"
+        elif crop is not None:
+            self.shown = None
+            content, problem = self.frame(quality)
+            return [{"type": "text", "text": "crop metadata unavailable; full-frame fallback"}] + content, problem
         self.shown = obs
         meta = {"frame": _int(headers.get("X-GameLens-Frame")), "observation": obs}
+        if view is not None:
+            meta["perception"] = view
         retention = headers.get("X-GameLens-Observation-Retention")
         if retention:
             meta["retention_seconds"] = retention
@@ -297,10 +329,34 @@ class GameLensClient:
 
     def tool_see(self, args: dict) -> tuple[list, bool]:
         quality = _bounded(args, "quality", 50, 1, 100)
-        content, problem = self.frame(quality)
+        crop = args.get("crop")
+        if crop is not None and crop not in ("full", "hud", "minimap", "dialog"):
+            raise ToolError("crop must be full, hud, minimap or dialog")
+        content, problem = self.frame(quality, crop=crop) if crop is not None else self.frame(quality)
         if problem:
             raise ToolError(problem)
         return content, False
+
+    def _tool_evidence(self, args, path):
+        if args:
+            raise ToolError("This read-only evidence tool accepts no arguments")
+        status, body, _ = self.request(path)
+        if status != 200:
+            raise ToolError(f"{path} answered HTTP {status}: {_detail(body)}")
+        try:
+            result = json.loads(body)
+        except ValueError:
+            raise ToolError("Evidence response was unreadable") from None
+        return [{"type": "text", "text": json.dumps(result, indent=1)}], False
+
+    def tool_metrics(self, args):
+        return self._tool_evidence(args, "/metrics")
+
+    def tool_skills(self, args):
+        return self._tool_evidence(args, "/skills")
+
+    def tool_learning(self, args):
+        return self._tool_evidence(args, "/learning")
 
     def tool_recording(self, args: dict) -> tuple[list, bool]:
         action = args.get("action")
@@ -507,6 +563,9 @@ class Server:
             "gamelens_state": client.tool_state,
             "gamelens_see": client.tool_see,
             "gamelens_act": client.tool_act,
+            "gamelens_metrics": client.tool_metrics,
+            "gamelens_skills": client.tool_skills,
+            "gamelens_learning": client.tool_learning,
         }
 
     def handle(self, message: dict) -> dict | None:

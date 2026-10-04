@@ -10,6 +10,7 @@ owner-authorized task; window enumeration and desktop handoff remain separate.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import logging
 import secrets
@@ -48,12 +49,13 @@ FRAME_POLL = 0.004
 class Encoded:
     """One encoded frame and the ids that name it."""
 
-    __slots__ = ("jpeg", "observation_id", "frame_id")
+    __slots__ = ("jpeg", "observation_id", "frame_id", "perception")
 
-    def __init__(self, jpeg: bytes, observation_id: str, frame_id: int) -> None:
+    def __init__(self, jpeg: bytes, observation_id: str, frame_id: int, perception=None) -> None:
         self.jpeg = jpeg
         self.observation_id = observation_id
         self.frame_id = frame_id
+        self.perception = perception
 
 
 class _Outcome:
@@ -271,6 +273,7 @@ def create_app(runtime) -> FastAPI:
     @app.get("/frame.jpg")
     async def frame_jpg(
         quality: int = 70,
+        crop: str | None = Query(default=None, max_length=32),
         after: int | None = Query(default=None, ge=0),
         frames: int = Query(default=1, ge=1, le=30),
         wait_ms: int = Query(default=500, ge=0, le=2000),
@@ -288,8 +291,11 @@ def create_app(runtime) -> FastAPI:
         from the pool that /stop is served from. So the wait polls on the loop,
         which holds nothing, and only the encode goes to a thread.
         """
+        if crop not in (None, "full", "hud", "minimap", "dialog"):
+            raise HTTPException(400, "crop must be full, hud, minimap or dialog")
+        options = {"crop": crop} if crop is not None else {}
         if after is None:
-            result = await asyncio.to_thread(runtime.encode_frame, quality)
+            result = await asyncio.to_thread(runtime.encode_frame, quality, **options)
             if result is ENCODE_FAILED:
                 raise HTTPException(503, "frame encode failed")
             if not isinstance(result, Encoded):
@@ -305,7 +311,7 @@ def create_app(runtime) -> FastAPI:
             while True:
                 if runtime.latest_frame_id() >= target:
                     result = await asyncio.to_thread(
-                        runtime.encode_frame, quality, min_frame_id=target
+                        runtime.encode_frame, quality, min_frame_id=target, **options
                     )
                     if isinstance(result, Encoded):
                         return _frame_response(result)
@@ -333,6 +339,8 @@ def create_app(runtime) -> FastAPI:
             "X-GameLens-Observation": result.observation_id,
             "X-GameLens-Frame": str(result.frame_id),
         }
+        if result.perception is not None:
+            headers["X-GameLens-Perception"] = json.dumps(result.perception, separators=(",", ":"), allow_nan=False)
         registry = getattr(runtime, "observations", None)
         if registry is not None:
             headers["X-GameLens-Observation-Retention"] = str(registry.retention_seconds)
@@ -399,7 +407,12 @@ def create_app(runtime) -> FastAPI:
         if recorder is None:
             raise HTTPException(503, "Recording is unavailable in this runtime")
         try:
-            return JSONResponse(recorder.stop())
+            result = recorder.stop()
+            record = getattr(runtime, "_metrics_call", None)
+            if record is not None and result.get("file"):
+                name = Path(result["file"]).name
+                record("link_video", name, name, end_seconds=result.get("seconds"))
+            return JSONResponse(result)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
 
@@ -447,6 +460,90 @@ def create_app(runtime) -> FastAPI:
         runtime.log.add(f"STOPPED by {role}", "denied")
         return JSONResponse(runtime.state())
 
+    @app.get("/metrics")
+    def metrics(role: str = Depends(any_role)):
+        metric = getattr(runtime, "run_metrics", None)
+        if metric is None:
+            raise HTTPException(503, "run metrics unavailable")
+        return metric.snapshot(runtime.run_id)
+
+    @app.post("/metrics/checkpoint")
+    def metrics_checkpoint(role: str = Depends(operator_only)):
+        checkpoint = getattr(runtime, "checkpoint_metrics", None)
+        if checkpoint is None:
+            raise HTTPException(503, "run metrics unavailable")
+        return checkpoint()
+
+    @app.post("/metrics/objective")
+    async def metrics_objective(request: Request, role: str = Depends(operator_only)):
+        body = await bounded_learning_body(request)
+        if set(body) != {"objective_id", "success", "evidence"}:
+            raise HTTPException(400, "objective requires objective_id, success and evidence references")
+        try:
+            return runtime.run_metrics.record_objective(runtime.run_id, **body)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.get("/skills")
+    def skills(role: str = Depends(any_role)):
+        from gamelens.game_skills import SkillCatalog
+        return {"skills": SkillCatalog.reference_catalog().list_skills(), "execution": "explicit-local-guarded-only"}
+
+    @app.get("/learning")
+    def learning(role: str = Depends(any_role)):
+        store = getattr(runtime, "reviewed_learning", None)
+        if store is None:
+            raise HTTPException(503, "reviewed learning unavailable")
+        return {"proposals": store.list_proposals(), "runtime_activation": False}
+
+    async def bounded_learning_body(request):
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 65536:
+                raise HTTPException(413, "proposal body exceeds 64 KiB")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        try:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise HTTPException(400, "invalid proposal JSON") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "proposal body must be an object")
+        return body
+
+    @app.post("/learning/proposals")
+    async def learning_propose(request: Request, role: str = Depends(any_role)):
+        body = await bounded_learning_body(request)
+        expected = {"skill_id", "failure_evidence", "candidate", "test_evidence"}
+        if set(body) != expected:
+            raise HTTPException(400, "proposal requires skill_id, failure_evidence, candidate and test_evidence")
+        try:
+            return runtime.reviewed_learning.propose(**body)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/learning/{proposal_id}/review")
+    async def learning_review(proposal_id: str, request: Request, role: str = Depends(operator_only)):
+        body = await bounded_learning_body(request)
+        if set(body) - {"candidate_hash", "decision", "notes"} or not {"candidate_hash", "decision"} <= set(body):
+            raise HTTPException(400, "review requires exact candidate_hash and decision")
+        try:
+            return runtime.reviewed_learning.review(proposal_id, owner="session-operator", **body)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/learning/{proposal_id}/activate")
+    async def learning_activate(proposal_id: str, request: Request, role: str = Depends(operator_only)):
+        body = await bounded_learning_body(request)
+        if set(body) != {"candidate_hash"}:
+            raise HTTPException(400, "activation requires exact candidate_hash")
+        try:
+            result = runtime.reviewed_learning.activate(proposal_id, owner="session-operator", **body)
+            return {"proposal": result, "runtime_activation": False}
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc)) from None
+
     @app.post("/act")
     async def act(request: Request, role: str = Depends(any_role)) -> JSONResponse:
         """Act on an image the server issued, named by its observation id.
@@ -481,6 +578,26 @@ def create_app(runtime) -> FastAPI:
         because obtaining it means waiting for the screen to settle afterwards.
         """
         body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "action body must be an object")
+        original_observation_id = body.get("observation_id")
+        views = getattr(runtime, "perception_views", None)
+        if views is not None:
+            try:
+                body = views.translate(body)
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise HTTPException(400, str(exc)) from None
+        metrics_context = body.get("metrics", {})
+        if not isinstance(metrics_context, dict) or set(metrics_context) - {"attempt", "retry_of"}:
+            raise HTTPException(400, "metrics accepts only attempt and retry_of")
+        attempt = metrics_context.get("attempt", 1)
+        retry_of = metrics_context.get("retry_of")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 100:
+            raise HTTPException(400, "attempt must be an integer from 1 to 100")
+        if retry_of is not None and (isinstance(retry_of, bool) or not isinstance(retry_of, (int, str)) or len(str(retry_of)) > 128):
+            raise HTTPException(400, "retry_of must be a bounded action identifier")
+        if (attempt == 1 and retry_of is not None) or (attempt > 1 and retry_of is None):
+            raise HTTPException(400, "retry attempts require retry_of; no automatic replay")
         observation_id = body.get("observation_id")
         if not observation_id:
             raise HTTPException(
@@ -576,8 +693,15 @@ def create_app(runtime) -> FastAPI:
             raise HTTPException(400, f"bad {kind} action: {exc}")
 
         fn = call.pop("fn")
+        dispatch = getattr(runtime, "dispatch_with_metrics", None)
+        if dispatch is not None:
+            context = {"observation_id": original_observation_id, "kind": kind,
+                       "attempt": attempt, "retry_of": retry_of}
+            submit = lambda **kwargs: dispatch(fn, context, **kwargs)
+        else:
+            submit = fn
         result = await asyncio.to_thread(
-            fn,
+            submit,
             observation_id=str(observation_id),
             label=label,
             source=role,

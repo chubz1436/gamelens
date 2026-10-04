@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--goal", default="play the game", help="what the vision tier should pursue")
     parser.add_argument("--vision-fps", type=float, default=2.0)
     parser.add_argument("--no-agent", action="store_true", help="capture and serve only")
+    parser.add_argument("--metrics-directory", help="Opt-in dedicated local run checkpoint directory; no images or credentials")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
 
@@ -123,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         rate=args.rate,
         pool_depth=args.pool_depth,
         backend=Backend(args.backend) if args.backend else None,
+        metrics_directory=args.metrics_directory,
     )
     lens.start()
 
