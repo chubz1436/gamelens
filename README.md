@@ -494,3 +494,20 @@ clicks.
 These review changes were authored statically. Before merge, run the focused
 regressions, existing suite and an owner-authorized disposable-window acceptance
 test. Do not describe an unexecuted test as passing.
+
+## Standalone setup checker (Phase 1)
+
+`tools/check_setup.ps1` or `python -B tools/check_setup.py` provides read-only,
+offline-by-default diagnostics without importing GameLens or starting capture.
+An explicit `--connect` and selected client/origin permits one bounded `GET /state`.
+Server-reported health is not frame verification, and the checker grants no input
+authorization. MCP inspection requires an explicit supported host and config file.
+See [the setup checker contract and limits](docs/SETUP_CHECKER.md).
+
+The isolated `tests_setup/` tests are **authored, NOT RUN** for this implementation.
+No installation, workflow dispatch, live-game test or later phase is included.
+
+## Remaining phases candidate
+
+See [metrics, cropped perception, reusable skills and reviewed learning](docs/REMAINING_PHASES.md)
+for the new opt-in interfaces and safety boundaries. No installation or gameplay starts from these additions.

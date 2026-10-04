@@ -8,11 +8,14 @@ import statistics
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
 
+from gamelens.run_metrics import RunMetrics
+from gamelens.run_store import LocalRunStore
+from gamelens.perception_bridge import PerceptionViews
 from gamelens.activity import ActivityMap
 from gamelens.arbiter import ActionRejected, Arbiter, Rejection
 from gamelens.capture import Backend, CaptureSupervisor
@@ -120,6 +123,7 @@ class Dispatch:
     injected_steps: int | None = None
     last_completed_step: int | None = None
     partial: bool = False
+    metrics_action_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -149,6 +153,7 @@ class Dispatch:
             "partial": self.partial,
             "churn": self.churn,
             "after_frame": self.after_frame,
+            **({"metrics_action_id": self.metrics_action_id} if self.metrics_action_id else {}),
             **(self.binding or {}),
         }
 
@@ -316,6 +321,7 @@ class GameLens:
         rate: float = 10.0,
         pool_depth: int = 4,
         backend: Backend | None = None,
+        metrics_directory=None,
     ) -> None:
         self.target: WindowInfo = (
             target if isinstance(target, WindowInfo) else find_window(target)
@@ -323,6 +329,17 @@ class GameLens:
         self.port = port
         self.tokens = Tokens()
         self.log = ActionLog()
+        self._video_link_lock = threading.Lock()
+        self._linked_clips = OrderedDict()
+        self._metrics_run_lock = threading.RLock()
+        self.run_metrics = RunMetrics()
+        self.run_id = self.run_metrics.begin_run()
+        self.run_store = LocalRunStore(base_directory=metrics_directory, enabled=metrics_directory is not None)
+        self.perception_views = PerceptionViews()
+        self._metrics_context = threading.local()
+        from gamelens.reviewed_learning import ReviewedLearningStore
+        self.reviewed_learning = ReviewedLearningStore()
+
 
         self.capture = CaptureSupervisor(
             self.target, pool_depth=pool_depth, forced=backend
@@ -364,7 +381,10 @@ class GameLens:
         recorder = getattr(self, "recorder", None)
         if recorder is not None:
             try:
-                recorder.stop()
+                clip = recorder.stop()
+                link = getattr(self, "link_recording", None)
+                if callable(link):
+                    link(clip)
             except ValueError:
                 log.error("Recorder still finishing during shutdown")
         self._stop.set()
@@ -375,6 +395,12 @@ class GameLens:
         self.executor.shutdown()
         self.capture.stop()
         self.safety.shutdown()
+        finish = getattr(self, "_metrics_call", None)
+        if callable(finish):
+            finish("finish_run", status="completed")
+        checkpoint = getattr(self, "checkpoint_metrics", None)
+        if callable(checkpoint):
+            checkpoint()
 
     def _poll(self) -> None:
         """Track geometry and frame statistics.
@@ -442,7 +468,7 @@ class GameLens:
         return self.capture.frames.latest_id()
 
     def encode_frame(self, quality: int = 70, *, min_frame_id: int | None = None,
-                     retain: bool = True):
+                     retain: bool = True, crop=None):
         """Encode the newest frame and register what was handed out. Never blocks.
 
         Returns ``Encoded`` -- whose ``frame_id`` is read off the very frame
@@ -476,6 +502,15 @@ class GameLens:
             # and a frame of a dropped capture is not to be shown (GL041-RV02-I01).
             if not self._from_live_backend(frame):
                 return NO_FRAME
+            self._metrics_call("record_observation", token, observation, source="snapshot" if retain else "stream")
+            if crop is not None:
+                from gamelens.perception import encode_perception
+                perception = encode_perception(frame.array, observation, crop=crop, quality=quality)
+                if not self._from_live_backend(frame):
+                    return NO_FRAME
+                view_token = self.perception_views.issue(token, perception.view)
+                self._metrics_call("record_observation", view_token, observation, source="crop")
+                return Encoded(perception.jpeg, view_token, frame.frame_id, perception.view.metadata())
             return Encoded(jpeg, token, frame.frame_id)
         except Exception:
             log.exception("frame encode failed")
@@ -513,6 +548,79 @@ class GameLens:
             return frame.array[:, :, :3].copy(), frame.session_id
         finally:
             frame.release()
+
+    def _metrics_call(self, method, *args, **kwargs):
+        metrics = getattr(self, "run_metrics", None)
+        if metrics is None:
+            return None
+        try:
+            with getattr(self, "_metrics_run_lock", metrics._lock):
+                if not metrics.has_run(self.run_id):
+                    self.run_id = metrics.begin_run()
+                return getattr(metrics, method)(self.run_id, *args, **kwargs)
+        except Exception:
+            log.debug("passive run metrics unavailable", exc_info=True)
+            return None
+
+    def metrics_snapshot(self):
+        return self._metrics_call("snapshot")
+
+    def checkpoint_metrics(self):
+        store = getattr(self, "run_store", None)
+        if store is None:
+            return {"saved": False, "reason": "disabled"}
+        try:
+            return store.save(self.metrics_snapshot())
+        except Exception:
+            log.warning("run checkpoint unavailable")
+            return {"saved": False, "reason": "storage unavailable"}
+
+    def link_recording(self, snapshot):
+        """Link a published playable clip, including interrupted finalized clips."""
+        if (not isinstance(snapshot, dict) or snapshot.get("active") is not False
+                or not snapshot.get("file")
+                or type(snapshot.get("frames")) is not int or snapshot["frames"] <= 0):
+            return False
+        metrics = getattr(self, "run_metrics", None)
+        if metrics is None:
+            return False
+        from pathlib import PureWindowsPath
+        try:
+            with getattr(self, "_video_link_lock", metrics._lock):
+                self.metrics_snapshot()
+                name = PureWindowsPath(snapshot["file"]).name
+                key = (self.run_id, name)
+                links = getattr(self, "_linked_clips", None)
+                if links is None:
+                    links = self._linked_clips = OrderedDict()
+                if key in links:
+                    return False
+                event = self._metrics_call("link_video", name, name, end_seconds=snapshot.get("seconds"),
+                                           interrupted=bool(snapshot.get("error")))
+                if event is None:
+                    return False
+                links[key] = True
+                while len(links) > 128:
+                    links.popitem(last=False)
+                return True
+        except Exception:
+            log.debug("passive clip link unavailable", exc_info=True)
+            return False
+
+    def dispatch_with_metrics(self, fn, context, **kwargs):
+        self._metrics_context.value = context
+        try:
+            result = fn(**kwargs)
+            if result.action_id is None:
+                action_id = "request-" + secrets.token_hex(8)
+                self._metrics_call("record_action", action_id, observation_id=context.get("observation_id"),
+                                   kind=context.get("kind", "unknown"), attempt=context.get("attempt", 1),
+                                   retry_of=context.get("retry_of"))
+                self._metrics_call("record_outcome", action_id, result.outcome, verdict=result.verdict)
+                result = replace(result, metrics_action_id=action_id)
+            return result
+        finally:
+            self._metrics_context.value = {}
 
     # --- actions ----------------------------------------------------------
 
@@ -808,6 +916,13 @@ class GameLens:
         """
         where = f" at ({int(x)},{int(y)})" if x is not None and y is not None else ""
         entry_id = self.log.add(f"{label}{where}", "queued")
+        context = getattr(getattr(self, "_metrics_context", None), "value", {})
+        bound_observation_id = "action-source-" + str(action.action_id)
+        metrics_observation = context.get("observation_id") or bound_observation_id
+        self._metrics_call("record_observation", bound_observation_id, getattr(action, "observation", None), source="action", freshness_limit=getattr(self.arbiter, "_observation_deadline", 1.0))
+        self._metrics_call("record_action", action.action_id, observation_id=metrics_observation,
+                           kind=context.get("kind", "guarded"), attempt=context.get("attempt", 1),
+                           retry_of=context.get("retry_of"), log_id=entry_id, bound_observation_id=bound_observation_id)
         if x is not None and y is not None:
             self.log.mark(x, y, "queued", label, entry_id=entry_id)
 
@@ -838,12 +953,19 @@ class GameLens:
             box.append(outcome)
             self.log.resolve(entry_id, outcome.status, outcome.detail)
             settled.set()
+            self._metrics_call("record_outcome", action.action_id, outcome.status, verdict="ok",
+                               completed_steps=getattr(outcome, "completed_steps", None),
+                               injected_steps=getattr(outcome, "injected_steps", None),
+                               partial=getattr(outcome, "partial", False),
+                               last_completed_step=getattr(outcome, "last_completed_step", None),
+                               after_frame=marks[0] if marks and (outcome.status == "sent" or getattr(outcome, "injected_steps", 0) > 0) else None)
 
         verdict = self.arbiter.submit(action, on_outcome=on_outcome)
         if verdict is not Rejection.OK:
             # Never queued, so no outcome is coming; resolve it here or the
             # entry sits at "queued" forever.
             self.log.resolve(entry_id, "denied", verdict.value)
+            self._metrics_call("record_outcome", action.action_id, "denied", verdict=verdict.name)
             return Dispatch(verdict.name, "denied", verdict.value, action.action_id,
                             binding=binding)
 
@@ -854,6 +976,8 @@ class GameLens:
             # working perfectly -- the honest answer to the wrong question.
             settled.wait(wait + _expected_duration(action))
         outcome = box[0] if box else None
+        if outcome is None:
+            self._metrics_call("record_outcome", action.action_id, "pending", verdict="ok")
         # 0 means nothing had been published yet: there is no frame to wait
         # past, and reporting 0 would make "any frame at all" look like "after".
         injected = (outcome is not None and (outcome.status == "sent" or getattr(outcome, "injected_steps", 0) > 0)
@@ -989,7 +1113,11 @@ class GameLens:
             },
             "safety": safety,
             "session": session,
-            "capabilities": {"anchored_click": "yellow-label-v1", "shared_input": True},
+            "capabilities": {"anchored_click": "yellow-label-v1", "shared_input": True,
+                             "cropped_perception": "full-parent-v1", "run_metrics": "run-v1",
+                             "reusable_skills": "guarded-v1", "reviewed_learning": "owner-review-v1"},
+            "run": {"id": getattr(self, "run_id", None), "persistence_enabled":
+                    bool(getattr(getattr(self, "run_store", None), "enabled", False))},
             "recording": self.recorder.snapshot() if hasattr(self, "recorder") else None,
             "observations": {"retention_seconds": self.observations.retention_seconds,
                              "snapshot_capacity": self.observations._capacity,

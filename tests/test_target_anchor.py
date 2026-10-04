@@ -89,7 +89,10 @@ def test_mouse_movement_inside_target_stops_click(live, monkeypatch):
     live[1].submit(Sequence(steps=[MoveTo(10, 20), Dwell(.01), ButtonDown(), ButtonUp()],
                            on_outcome=lambda o: (outcomes.append(o), done.set())))
     assert done.wait(2)
-    assert outcomes[0].status == "denied" and outcomes[0].detail == Denial.POINTER_MOVED.value
+    assert outcomes[0].status == "denied"
+    assert outcomes[0].partial and outcomes[0].injected_steps == 1
+    assert "do not replay" in outcomes[0].detail
+    assert Denial.POINTER_MOVED.value in outcomes[0].detail
     assert not any(e.mi.dwFlags & gl_input.MOUSEEVENTF_LEFTDOWN for e in events if e.type == gl_input.INPUT_MOUSE)
 
 

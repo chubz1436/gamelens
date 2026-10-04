@@ -145,7 +145,7 @@ def test_stdio_handshake_inventory_and_selected_state_without_input(pair):
         assert init["serverInfo"]["name"] == "gamelens-multi"
         assert init["protocolVersion"] == "2024-11-05"
         tools = c.call("tools/list")["result"]["tools"]
-        assert len(tools) == 7
+        assert len(tools) == 10
         for tool in tools:
             if tool["name"] not in ("gamelens_clients", "gamelens_profile"):
                 schema = tool["inputSchema"]
@@ -319,5 +319,5 @@ def test_ten_client_example_inventory_isolation_and_unknown_eleventh_fail_closed
                 "arguments": {"client": "client11"}}})["result"]
             assert result["isError"] and "Nothing was dispatched" in text(result)
     assert requests == []
-    assert len(TOOLS) == 6
+    assert len(TOOLS) == 9
     assert all("client" not in t["inputSchema"]["properties"] for t in TOOLS)

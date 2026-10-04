@@ -133,3 +133,12 @@ class MultiClient:
 
     def tool_session(self, args: dict):
         return self._route("tool_session", args)
+
+    def tool_metrics(self, args: dict):
+        return self._route("tool_metrics", args)
+
+    def tool_skills(self, args: dict):
+        return self._route("tool_skills", args)
+
+    def tool_learning(self, args: dict):
+        return self._route("tool_learning", args)

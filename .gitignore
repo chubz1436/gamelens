@@ -40,3 +40,8 @@ _play.py
 /wood2.py
 /wood3.py
 /profiles/clients.local.json
+
+# Retain local validation details without publishing machine-specific raw logs.
+/evidence/remaining-phases-20261004/*.log
+/evidence/remaining-phases-20261004/*.xml
+/evidence/remaining-phases-20261004/*.patch

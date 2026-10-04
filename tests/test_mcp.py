@@ -199,7 +199,7 @@ def test_an_unknown_protocol_version_gets_the_newest_supported(stub):
 
 def test_tools_are_listed_with_schemas(client):
     tools = {t["name"]: t for t in client.call("tools/list")["result"]["tools"]}
-    assert set(tools) == {"gamelens_state", "gamelens_see", "gamelens_act", "gamelens_profile", "gamelens_recording", "gamelens_session"}
+    assert set(tools) == {"gamelens_state", "gamelens_see", "gamelens_act", "gamelens_profile", "gamelens_recording", "gamelens_session", "gamelens_metrics", "gamelens_skills", "gamelens_learning"}
     assert tools["gamelens_act"]["inputSchema"]["required"] == ["action"]
 
 

@@ -75,7 +75,7 @@ def test_plugin_bootstrap_serves_profile_from_unrelated_cwd(tmp_path):
     assert [reply["id"] for reply in replies] == [1, 2, 3]
     assert replies[0]["result"]["serverInfo"]["name"] == "gamelens"
     assert {tool["name"] for tool in replies[1]["result"]["tools"]} == {
-        "gamelens_profile", "gamelens_state", "gamelens_see", "gamelens_act", "gamelens_recording", "gamelens_session",
+        "gamelens_profile", "gamelens_state", "gamelens_see", "gamelens_act", "gamelens_recording", "gamelens_session", "gamelens_metrics", "gamelens_skills", "gamelens_learning",
     }
     assert not replies[2]["result"]["isError"]
     guide = json.loads(replies[2]["result"]["content"][0]["text"])
