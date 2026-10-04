@@ -44,3 +44,8 @@ These tests use fake observations and temporary directories. They do not send li
 
 An idle runtime run that expires rotates to a new run ID on the next evidence operation.
 Original timestamps are not refreshed; bounded retention still applies to expired runs.
+
+Published playable interrupted clips remain correlated when the recorder finishes with a
+file and positive frame count. Video evidence includes optional `interrupted: true`, never
+the arbitrary interruption text or path. Active clips, missing published files and failed
+finalization remain excluded. Older video events without this flag remain valid.

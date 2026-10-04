@@ -576,10 +576,10 @@ class GameLens:
             return {"saved": False, "reason": "storage unavailable"}
 
     def link_recording(self, snapshot):
-        """Link a successfully finalized clip once; never starts recording/input."""
+        """Link a published playable clip, including interrupted finalized clips."""
         if (not isinstance(snapshot, dict) or snapshot.get("active") is not False
-                or snapshot.get("error") or not snapshot.get("file")
-                or not snapshot.get("frames")):
+                or not snapshot.get("file")
+                or type(snapshot.get("frames")) is not int or snapshot["frames"] <= 0):
             return False
         metrics = getattr(self, "run_metrics", None)
         if metrics is None:
@@ -595,7 +595,8 @@ class GameLens:
                     links = self._linked_clips = OrderedDict()
                 if key in links:
                     return False
-                event = self._metrics_call("link_video", name, name, end_seconds=snapshot.get("seconds"))
+                event = self._metrics_call("link_video", name, name, end_seconds=snapshot.get("seconds"),
+                                           interrupted=bool(snapshot.get("error")))
                 if event is None:
                     return False
                 links[key] = True

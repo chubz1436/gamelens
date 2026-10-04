@@ -75,11 +75,17 @@ def validate_snapshot(snapshot, max_events):
         if not isinstance(event, dict) or event.get('kind') not in EVENT_KEYS:
             raise ValueError('Invalid event')
         kind = event['kind']
-        _keys(event, BASE_EVENT_KEYS | EVENT_KEYS[kind])
+        expected = BASE_EVENT_KEYS | EVENT_KEYS[kind]
+        if kind == 'video' and 'interrupted' in event:
+            expected = expected | {'interrupted'}
+        _keys(event, expected)
         for key, value in event.items():
             if key in NUMERIC_KEYS:
                 if value is not None:
                     number(value)
+            elif key == 'interrupted':
+                if type(value) is not bool:
+                    raise ValueError('Invalid video interruption flag')
             elif key in BOOL_KEYS:
                 objective(value)
             elif key == 'provenance':

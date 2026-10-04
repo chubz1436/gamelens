@@ -196,3 +196,108 @@ def test_full_transition_history_retains_latest_rejection(tmp_path):
     assert loaded.active_candidates() == []
     assert loaded.get(p['id'])['history'][-1]['decision'] == 'reject'
     assert loaded.get(p['id'])['proposal'] == p['proposal']
+
+def test_byte_boundary_rejection_keeps_immutable_evidence(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    failure = {'outcome': 'failed', 'evidence': 'x' * 261326}
+    p = s.propose('demo', failure, {'description': 'Observe'}, {'passed': True, 'evidence': 'fixture'})
+    s.review(p['id'], p['candidate_hash'], 'approve', 'owner')
+    s.activate(p['id'], p['candidate_hash'], 'owner')
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', 'owner')
+    assert not rejected['active']
+    assert rejected['review']['decision'] == 'reject'
+    assert rejected['proposal'] == p['proposal']
+    assert rejected['candidate_hash'] == p['candidate_hash']
+    assert s.active_candidates() == []
+    persisted = json.loads(path.read_text())[p['id']]
+    assert persisted['active'] is False
+    assert persisted['review']['decision'] == 'reject'
+    loaded = ReviewedLearningStore(path)
+    assert loaded.active_candidates() == []
+    assert loaded.get(p['id'])['proposal'] == p['proposal']
+    assert loaded.get(p['id'])['candidate_hash'] == p['candidate_hash']
+
+
+def test_byte_boundary_long_owner_and_note_cannot_block_rejection(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    p = s.propose('demo', {'outcome': 'failed', 'evidence': 'x' * 261326}, {'description': 'Observe'}, {'passed': True, 'evidence': 'fixture'})
+    s.review(p['id'], p['candidate_hash'], 'approve', 'owner')
+    s.activate(p['id'], p['candidate_hash'], 'owner')
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', 'r' * 128, 'n' * 4096)
+    assert rejected['review']['owner'] == 'r' * 128
+    assert rejected['review']['notes'] == ''
+    assert not rejected['active']
+    assert rejected['proposal'] == p['proposal']
+    assert s.active_candidates() == []
+    persisted = json.loads(path.read_text())[p['id']]
+    assert persisted['review']['decision'] == 'reject'
+    assert persisted['active'] is False
+    assert ReviewedLearningStore(path).get(p['id'])['proposal'] == p['proposal']
+
+def test_http_sized_history_rejection_prunes_bytes(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    p = s.propose('demo', {'outcome': 'failed', 'evidence': 'x' * 60079}, {'description': 'Observe'}, {'passed': True, 'evidence': 'fixture'})
+    for _ in range(46):
+        s.review(p['id'], p['candidate_hash'], 'approve', 'session-operator', 'n' * 4096)
+    for _ in range(34):
+        s.review(p['id'], p['candidate_hash'], 'approve', 'session-operator')
+    s.activate(p['id'], p['candidate_hash'], 'session-operator')
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', 'session-operator')
+    assert rejected['history'][-1]['decision'] == 'reject'
+    assert rejected['proposal'] == p['proposal']
+    assert rejected['candidate_hash'] == p['candidate_hash']
+    assert not s.active_candidates()
+    assert json.loads(path.read_text())[p['id']]['active'] is False
+    assert ReviewedLearningStore(path).get(p['id'])['history'][-1]['decision'] == 'reject'
+
+
+def test_unicode_annotations_are_byte_bounded_and_cannot_block_rejection(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    p = s.propose('demo', {'outcome': 'failed', 'evidence': 'x' * 261326}, {'description': 'Observe'}, {'passed': True, 'evidence': 'fixture'})
+    s.review(p['id'], p['candidate_hash'], 'approve', 'owner')
+    s.activate(p['id'], p['candidate_hash'], 'owner')
+    with pytest.raises(LearningDenied):
+        s.review(p['id'], p['candidate_hash'], 'reject', '\U0001f600' * 128)
+    assert s.get(p['id'])['active']
+    owner = '\U0001f600' * 10  # 120 escaped serialized bytes, within identity bound.
+    rejected = s.review(p['id'], p['candidate_hash'], 'reject', owner, '\U0001f600' * 4096)
+    assert rejected['review']['owner'] == owner
+    assert rejected['review']['notes'] == ''
+    assert not rejected['active']
+    assert rejected['proposal'] == p['proposal']
+    assert json.loads(path.read_text())[p['id']]['review']['decision'] == 'reject'
+
+def rejection_reserve_boundary_record():
+    from gamelens.reviewed_learning import digest, snapshot
+    # Initial envelope is ~262067 bytes, leaving less than max-owner rejection
+    # plus compact audit metadata while still satisfying the original bound.
+    proposal = dict(skill_id='demo', failure_evidence={'outcome': 'failed', 'evidence': 'x' * 261692}, candidate={'description': 'Observe'}, test_evidence={'passed': True, 'evidence': 'fixture'})
+    key = digest(proposal)
+    record = dict(id=key, candidate_hash=key, proposal=proposal, review=None, active=False, history=[])
+    snapshot(record)  # Establish the initial envelope itself is legal.
+    return key, record
+
+
+def test_rejection_reserve_denial_does_not_commit(tmp_path):
+    path = tmp_path / 'store.json'
+    s = ReviewedLearningStore(path)
+    _, record = rejection_reserve_boundary_record()
+    proposal = record['proposal']
+    with pytest.raises(LearningDenied):
+        s.propose(**proposal)
+    assert s.list_proposals() == []
+    assert not path.exists()
+
+
+def test_legacy_record_without_rejection_reserve_fails_closed(tmp_path):
+    path = tmp_path / 'store.json'
+    key, record = rejection_reserve_boundary_record()
+    contents = json.dumps({key: record}, separators=(',', ':'), sort_keys=True)
+    path.write_text(contents)
+    with pytest.raises(LearningDenied):
+        ReviewedLearningStore(path)
+    assert path.read_text() == contents

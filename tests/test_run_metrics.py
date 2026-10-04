@@ -188,3 +188,20 @@ def test_sub_microsecond_future_timestamp_is_not_hidden_by_rounding(metrics, clo
     run = metrics.begin_run()
     event = metrics.record_observation(run, 'slightly-future', {'frame_captured_at': clock[0]+0.0000001}, freshness_limit=1)
     assert event['fresh'] is False
+
+
+def test_video_interruption_flag_is_bounded_and_store_accepts_old_snapshots(metrics):
+    from gamelens.run_store import validate_snapshot
+    run=metrics.begin_run()
+    ordinary=metrics.link_video(run,'normal','normal.mp4')
+    assert 'interrupted' not in ordinary
+    validate_snapshot(metrics.snapshot(run),metrics.max_events)
+    interrupted=metrics.link_video(run,'interrupted','interrupted.mp4',interrupted=True)
+    assert interrupted['interrupted'] is True
+    validate_snapshot(metrics.snapshot(run),metrics.max_events)
+    with pytest.raises(ValueError):
+        metrics.link_video(run,'bad','bad.mp4',interrupted='raw error')
+    invalid=metrics.snapshot(run)
+    invalid['events'][-1]['interrupted']=None
+    with pytest.raises(ValueError):
+        validate_snapshot(invalid,metrics.max_events)

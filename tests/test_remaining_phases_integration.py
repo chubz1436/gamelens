@@ -322,9 +322,10 @@ def test_crop_sequence_canonical_operations_map_nonzero_origin(runtime,operation
     assert len(points)==1 and points[0].x==pytest.approx(px) and points[0].y==pytest.approx(py)
 
 
-def test_orderly_shutdown_final_clip_is_deduplicated_and_persisted(runtime,tmp_path):
+@pytest.mark.parametrize('warning', ['', 'Capture session or size changed; recording stopped.'])
+def test_orderly_shutdown_final_clip_is_deduplicated_and_persisted(runtime,tmp_path,warning):
     runtime.run_store=LocalRunStore(tmp_path,enabled=True)
-    clip={'active':False,'error':'','file':str(tmp_path/'fixture.mp4'),'frames':60,'seconds':2.0}
+    clip={'active':False,'error':warning,'file':str(tmp_path/'fixture.mp4'),'frames':60,'seconds':2.0}
     events=[]
     runtime.recorder=SimpleNamespace(stop=lambda:(events.append('recorder') or dict(clip)))
     runtime.safety=SimpleNamespace(kill=lambda reason:events.append('kill'),shutdown=lambda:None)
@@ -339,11 +340,13 @@ def test_orderly_shutdown_final_clip_is_deduplicated_and_persisted(runtime,tmp_p
     assert len(saved)==1 and saved[0]['status']=='completed'
     videos=[e for e in saved[0]['events'] if e['kind']=='video']
     assert len(videos)==1 and videos[0]['reference']=='fixture.mp4' and videos[0]['end_seconds']==2.0
+    assert videos[0].get('interrupted', False) is bool(warning)
 
 
-def test_shutdown_links_new_clip_before_finishing_run(runtime,tmp_path):
+@pytest.mark.parametrize('warning', ['', 'No fresh capture frame; recording stopped.'])
+def test_shutdown_links_new_clip_before_finishing_run(runtime,tmp_path,warning):
     runtime.run_store=LocalRunStore(tmp_path,enabled=True)
-    clip={'active':False,'error':'','file':str(tmp_path/'new.mp4'),'frames':30,'seconds':1.0}
+    clip={'active':False,'error':warning,'file':str(tmp_path/'new.mp4'),'frames':30,'seconds':1.0}
     runtime.recorder=SimpleNamespace(stop=lambda:clip)
     runtime.safety=SimpleNamespace(kill=lambda reason:None,shutdown=lambda:None)
     runtime._stop=SimpleNamespace(set=lambda:None);runtime._poller=None;runtime.agent=None
@@ -351,3 +354,53 @@ def test_shutdown_links_new_clip_before_finishing_run(runtime,tmp_path):
     runtime.stop()
     kinds=[e['kind'] for e in runtime.run_store.snapshots()[0]['events']]
     assert kinds.index('video')<kinds.index('terminal')
+
+
+@pytest.mark.parametrize('warning', ['', 'Capture session or size changed; recording stopped.'])
+def test_http_stop_links_published_interrupted_clip(runtime,tmp_path,warning):
+    clip={'active':False,'error':warning,'file':str(tmp_path/'http.mp4'),'frames':30,'seconds':1.0}
+    runtime.recorder=SimpleNamespace(stop=lambda:dict(clip))
+    with client(runtime) as c:
+        result=c.post('/recording/stop')
+        assert result.status_code==200 and result.json()['error']==warning
+        assert c.post('/recording/stop').status_code==200
+    videos=[event for event in runtime.metrics_snapshot()['events'] if event['kind']=='video']
+    assert len(videos)==1 and videos[0]['reference']=='http.mp4'
+    assert videos[0].get('interrupted', False) is bool(warning)
+    assert warning not in json.dumps(videos) if warning else True
+
+
+@pytest.mark.parametrize('invalid', [{'active':True}, {'file':None}, {'frames':0}, {'frames':-1}, {'frames':True}])
+def test_clip_link_refuses_unpublished_or_active_snapshots(runtime,invalid):
+    clip={'active':False,'error':'Interrupted or invalid finalization','file':'fixture.mp4','frames':30,'seconds':1.0}
+    clip.update(invalid)
+    assert runtime.link_recording(clip) is False
+    assert not [event for event in runtime.metrics_snapshot()['events'] if event['kind']=='video']
+
+
+def test_http_multireview_byte_capacity_allows_rejection(runtime,tmp_path):
+    path=tmp_path/'reviewed.json'
+    runtime.reviewed_learning=ReviewedLearningStore(path)
+    body=dict(skill_id='demo',failure_evidence={'outcome':'failed','evidence':'x'*60079},
+              candidate={'description':'Observe'},test_evidence={'passed':True,'evidence':'fixture'})
+    assert len(json.dumps(body,separators=(',',':')).encode())<65536
+    with client(runtime,'operator') as c:
+        result=c.post('/learning/proposals',json=body)
+        assert result.status_code==200
+        original=result.json()
+        url='/learning/'+original['id']
+        review={'candidate_hash':original['candidate_hash'],'decision':'approve'}
+        for notes, count in [('n'*4096,46),('',34)]:
+            for _ in range(count):
+                result=c.post(url+'/review',json={**review,'notes':notes})
+                assert result.status_code==200
+        result=c.post(url+'/activate',json={'candidate_hash':original['candidate_hash']})
+        assert result.status_code==200 and result.json()['proposal']['active'] is True
+        result=c.post(url+'/review',json={**review,'decision':'reject'})
+        assert result.status_code==200
+        rejected=result.json()
+    assert rejected['active'] is False and rejected['history'][-1]['decision']=='reject'
+    assert rejected['proposal']==original['proposal'] and rejected['candidate_hash']==original['candidate_hash']
+    persisted=json.loads(path.read_text())[original['id']]
+    assert persisted['active'] is False and persisted['review']['decision']=='reject'
+    assert ReviewedLearningStore(path).get(original['id'])['proposal']==original['proposal']

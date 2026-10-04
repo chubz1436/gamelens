@@ -50,6 +50,11 @@ class ReviewedLearningStore:
                 self._validate_record(key, record)
                 record['active'] = False
                 record['review'] = None
+                reserve = snapshot(record)
+                reserve['history'] = []
+                reserve['review'] = dict(candidate_hash=key, decision='reject', owner='x' * 128, notes='')
+                reserve['history'] = [dict(event='reject', decision='reject')]
+                snapshot(reserve)
             self._records = records
 
     @classmethod
@@ -70,6 +75,9 @@ class ReviewedLearningStore:
             event = entry.get('event')
             if event == 'review':
                 cls._validate_review(key, {k: v for k, v in entry.items() if k != 'event'})
+            elif event == 'reject':
+                if entry != dict(event='reject', decision='reject'):
+                    raise LearningDenied('invalid compact rejection history')
             elif event == 'activate':
                 if set(entry) != {'event', 'candidate_hash', 'owner'} or entry['candidate_hash'] != key:
                     raise LearningDenied('invalid activation history')
@@ -79,7 +87,7 @@ class ReviewedLearningStore:
 
     @staticmethod
     def _validate_owner(owner):
-        if not isinstance(owner, str) or not owner.strip() or len(owner) > 128:
+        if not isinstance(owner, str) or not owner.strip() or len(owner) > 128 or len(json.dumps(owner).encode('utf-8')) > 130:
             raise LearningDenied('authenticated owner identity required')
 
     @classmethod
@@ -156,6 +164,11 @@ class ReviewedLearningStore:
                 records = dict(self._records)
                 records[key] = dict(id=key, candidate_hash=key, proposal=p, review=None, active=False, history=[])
                 self._validate_record(key, records[key])
+                # Reserve a rejection state for even the longest allowed owner.
+                reserve = snapshot(records[key])
+                reserve['review'] = dict(candidate_hash=key, decision='reject', owner='x' * 128, notes='')
+                reserve['history'] = [dict(event='reject', decision='reject')]
+                snapshot(reserve)
                 self._commit(records)
             return self.get(key)
 
@@ -174,13 +187,27 @@ class ReviewedLearningStore:
         r = self.get(proposal_id)
         if candidate_hash != r['candidate_hash'] or candidate_hash != digest(r['proposal']):
             raise LearningDenied('exact candidate/evidence hash required')
-        if not isinstance(owner, str) or not owner.strip() or len(owner) > 128:
-            raise LearningDenied('authenticated owner identity required')
+        self._validate_owner(owner)
         return r
 
     def _replace(self, key, record):
         record['history'] = record['history'][-100:]
-        snapshot(record)
+        while True:
+            if not record['history'] and record['review'] and record['review']['decision'] == 'reject':
+                record['history'] = [dict(event='reject', decision='reject')]
+            try:
+                snapshot(record)
+                break
+            except LearningDenied:
+                if record['history'] and record['history'] != [dict(event='reject', decision='reject')]:
+                    record['history'].pop(0)
+                    continue
+                # Revocation must not be blocked by optional annotation size.
+                # Immutable candidate/evidence are never shortened.
+                if record['review'] and record['review']['decision'] == 'reject' and record['review']['notes']:
+                    record['review']['notes'] = ''
+                    continue
+                raise
         records = dict(self._records)
         records[key] = record
         self._commit(records)

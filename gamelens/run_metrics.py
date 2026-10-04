@@ -244,13 +244,18 @@ class RunMetrics:
         references = [identifier(item) for item in evidence]
         return self._event(run_id, 'objective', {'objective_id': identifier(objective_id),
                                                'objective_success': success, 'evidence': references})
-    def link_video(self, run_id, video_id, reference, *, start_seconds=None, end_seconds=None):
+    def link_video(self, run_id, video_id, reference, *, start_seconds=None, end_seconds=None, interrupted=False):
+        if type(interrupted) is not bool:
+            raise ValueError('Video interruption flag must be boolean')
         start = None if start_seconds is None else number(start_seconds)
         end = None if end_seconds is None else number(end_seconds)
         if (start is not None and start < 0) or (end is not None and end < 0) or (start is not None and end is not None and end < start):
             raise ValueError('Invalid video span')
-        return self._event(run_id, 'video', {'video_id': identifier(video_id), 'reference': video_reference(reference),
-                                           'start_seconds': start, 'end_seconds': end})
+        fields = {'video_id': identifier(video_id), 'reference': video_reference(reference),
+                  'start_seconds': start, 'end_seconds': end}
+        if interrupted:
+            fields['interrupted'] = True
+        return self._event(run_id, 'video', fields)
 
     def has_run(self, run_id):
         """Cheap live-ID check for hosts resuming after bounded idle retention."""
