@@ -7,6 +7,7 @@ docs/REVIEWED_LEARNING.md
 docs/RUN_METRICS.md
 docs/SETUP_CHECKER.md
 evidence/remaining-phases-20261004/final-report.md
+evidence/remaining-phases-20261004/final-rereview.md
 evidence/remaining-phases-20261004/implementation-start.md
 evidence/remaining-phases-20261004/independent-review.md
 evidence/remaining-phases-20261004/learning-worker.md

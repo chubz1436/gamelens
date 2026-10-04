@@ -45,3 +45,19 @@ Independent review is closed with no unresolved substantive findings; parent CHU
 final overall PR6review. No source changes after this validation; final handoff commits
 are evidence only. See final-report.md for phase ownership, changed-file manifest, exact
 source commit, review resolutions, reproduction commands, acceptance limits and raw hashes.
+
+## Post-handoff parent final-review closure
+
+Supersedes prior tested-source/count checkpoints. Sourcef39fc82ef70cb72cd82faac6319cb08337263204
+fixes the reproduced256KiB rejection failures (both261490B library proposal and60243B HTTP
+proposal after80reviews), with byte/count history trimming and reserved bounded rejection
+metadata. Immutable proposals/hashes survive; oversized optional rejection notes can be omitted
+and owner identity has a documented128JSON-escaped-content-byte bound. Insufficient-reserve
+proposal and legacy-load branches fail closed with memory/file preservation fixtures.
+Published playable interrupted clips now remain correlated; warning is only an optionalboolean,
+legacy video schemas remain readable and raw error/path text is absent from metrics.
+Final affected134passed/5skipped/0failed/1existingwarn8.23s; complete aggregate1108passed/5skipped/
+0failed/1existingwarn121.91s. Phase1 source unchanged, prior92pass3skip0fail retained.
+Independent final source/coverage review closed without unresolved substantive findings.
+No source edits after aggregate; final handoff metadata commit is evidence only.
+See final-rereview.md and final-report.md; reproduction and raw logs/JUnit remain project-local.
