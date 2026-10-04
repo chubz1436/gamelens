@@ -4,7 +4,7 @@ agent: /root/skills_framework
 task: remaining-phases-20261004
 requested_model: gpt-6.1-sol
 observed_model: unknown
-status: complete-source-and-focused-validation
+status: complete-source-and-aggregate-validation
 ---
 
 # Phase4 reusable skills and Phase5 oversight
@@ -28,3 +28,5 @@ Root should run the updated focused suites in the coordinated sole Python proces
 - 2026-10-04 10:46:41 +08:00 - Verified primary-agent review-regressions.log/XML: 110 passed, 4 skipped, 1 warning in 3.28s. Suite breakdown: tests.test_game_skills: 48 passed including long one-second successful callback, two-step quiescence, real synthetic held-input cancellation and deadline cleanup; tests.test_reviewed_learning: 26 passed and 4 symlink cases skipped for Windows privilege 1314; integration: 20 passed and run_metrics: 16 passed. This worker started no Python process. Broader root integration/baseline acceptance and git integration remain primary-owned.
 
 - 2026-10-04 11:01:45 +08:00 - PR6 owner review reopened Phase4: exact ProfilePin version/content-hash compatibility now required for executable definitions and all observations. Same-ID edits and unpinned legacy executable definitions fail closed. Portable installed-skill symbols replace owner-specific absolute paths. Added GameLensSkillHost using supplied real runtime encode_frame, original registry resolve, original capture timestamp and arbiter provenance recheck, pure perception facts, and existing guarded submit_sequence. Mandatory original captured_at has no construction-time default; capture age uses the actual GameLens monotonic clock while injected clocks apply only to budgets. Added real-runtime synthetic host success and mutation/refusal fixtures, plus profile admission/midrun, stale/future/omitted capture evidence regressions. Updated docs clarify built-in reference-only catalog versus executable user-defined skills. No Python process started; updated root validation pending.
+
+- 2026-10-04 11:06:47 +08:00 - Final validation verified from primary complete-aggregate.log/XML at code commit fe0239f: 1091 passed, 5 skipped, 0 failures, 1 warning in 119.06 seconds. All 69 game-skills tests passed, including same-ID profile version/hash admission and post-outcome rejection, mandatory original timestamps, actual GameLens host guard integration, after-action profile mutation and missing-frame cancellation. Reviewed-learning collected 32 tests: 28 passed and 4 link-privilege cases skipped; fifth aggregate skip is run-store symlink privilege. This worker and its delegated learning worker started no Python test process. No source edits after stable validation. Primary has verified mirrors of the worker logs in the canonical Obsidian vault and will resync this final fragment; this worker performed no out-of-scope vault write. Phase1 unittest and git integration remain primary-owned. No remaining Phase4/5 implementation blocker or live gameplay acceptance claim.

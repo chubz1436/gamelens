@@ -33,3 +33,15 @@ links on orderly shutdown before finish/checkpoint with bounded dedupe; repeated
 idempotent and bounded-history rejection remains possible. Idle metrics rotate on resumed
 operations. Legacy partial-action/shutdown diagnostic compatibility corrected. Aggregate/Phase1
 validation continues; no live gameplay/input/deployment.
+
+## Final completed checkpoint
+
+Supersedes all earlier outstanding validation/status notes above. Tested source:
+fe0239f59473c518f3c58a4ca7791c62651a6ddd. Complete aggregate1091passed/5skipped/0failures,
+one existing dependency warning,119.06s. Phase1standalone92passed/3skipped/0failures,
+95total,30.561s. Six combined skips are Windows symlink fixture privilege limits; two
+Phase1cases lack an owner-selected real older interpreter. All69skills tests passed.
+Independent review is closed with no unresolved substantive findings; parent CHUBot owns
+final overall PR6review. No source changes after this validation; final handoff commits
+are evidence only. See final-report.md for phase ownership, changed-file manifest, exact
+source commit, review resolutions, reproduction commands, acceptance limits and raw hashes.
